@@ -22,43 +22,21 @@ To Do:
 '''
 
 import sys, commands, string, gzip, getopt, os, cPickle
-from eigentype import eigentype
+from eigentype import *
 import scipy.io as io
 import numpy as np
 
 def extract_tokens(filehandle, sentence, tokens, left_con, right_con, con_length, pos_depend):
     sentence_items = sentence.split()
+    extractor = context_extractor(con_length, pos_depend)
     for rule in filehandle:
         phrase_pair = ' ||| '.join(rule.strip().split(' ||| ')[:2])
         span = rule.strip().split(' ||| ')[2]
         tokens.add_token([phrase_pair])
         left_idx = int(span.split('-')[0])
         right_idx = int(span.split('-')[1])
-        left_con_idx = left_idx - con_length
-        left_con_words = []
-        while left_con_idx < left_idx:
-            if left_con_idx < 0:
-                left_con_words.append("<s>")
-                left_con_idx = 0
-            else:
-                context_word = sentence_items[left_con_idx]
-                if pos_depend:
-                    context_word += "_dist%d"%(left_idx-left_con_idx)
-                left_con_words.append(context_word) #may want to decorate word with distance to distinguish
-                left_con_idx += 1
+        left_con_words, right_con_words = extractor.extract_context(sentence_items, left_idx, right_idx)
         left_con.add_token(left_con_words)
-        right_con_idx = right_idx + 1
-        right_con_words = []
-        while right_con_idx < right_idx + con_length + 1:
-            if right_con_idx >= len(sentence_items):
-                right_con_words.append("</s>")
-                break
-            else:
-                context_word = sentence_items[right_con_idx]
-                if pos_depend:
-                    context_word += "_dist%d"%(right_con_idx-right_idx)
-                right_con_words.append(context_word)
-                right_con_idx += 1
         right_con.add_token(right_con_words)
 
 def matlab_interface(left_mat, right_mat, rank):
@@ -99,7 +77,7 @@ def main():
             con_length = int(opt[1])
         elif opt[0] == '-k':
             rank = int(opt[1])
-        elif opt[0] == '-p':
+        elif opt[0] == '-p': #position-dependent feature extraction
             pos_depend = True
 
     tokens = eigentype()
@@ -122,6 +100,8 @@ def main():
     paramDict["right_con"] = right_con
     paramDict["lowrank_con"] = bidi_lowrank_con
     paramDict["tokens"] = tokens
+    paramDict["con_length"] = con_length
+    paramDict["pos_depend"] = pos_depend
     cPickle.dump(paramDict, open(output_loc, "wb"))
 
 if __name__ == "__main__":
