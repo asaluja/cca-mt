@@ -10,15 +10,17 @@ on a token basis, which are extremely sparse matrices.  It then computes a CCA b
 co-occurrence matrices, resulting in two projection matrices, one for context, and one for
 phrase pairs, which brings them into the same space.  These projection matrices are written
 out for subsequent decoding/evaluation. 
-arg0: directory location of sentence-specific phrase pair lists
+arg0: directory location of sentence-specific phrase pairs (in .gz format; output of extract
 arg1: output location of parameters
 STDIN: training corpus (can be parallel or just source)
 Flags:
--l: change context length (default is 2 i.e., 2 words on each side)
-To Do:
-- add flag to restrict context/features to N most frequent words. 
-- add flag for stop word filtering (remove N top words)
-- add flag for feature scaling before CCA
+-l arg: change context length (default is 2 i.e., 2 words on each side)
+-r arg: change rank (default is 50)
+-k arg: enable re-scaling of features based on diagonal approximation to covariance, with an additional scaling factor (default: disabled)
+-p: make context features position-dependent
+-s arg: filter stop words, provided in arg (list of words to remove)
+-f arg: filter to words provided in arg; if they contain stop words and stop words is enabled, then they will be removed
+-c arg: write out counts in cPickle format to location specified by arg
 '''
 
 import sys, commands, string, gzip, getopt, os, cPickle
@@ -26,11 +28,18 @@ from eigentype import *
 import scipy.io as io
 import numpy as np
 
-def extract_tokens(filehandle, sentence, tokens, left_con, right_con, con_length, pos_depend):
+def extract_tokens(filehandle, sentence, tokens, left_con, right_con, con_length, pos_depend, count_dict):
     sentence_items = sentence.split()
     extractor = context_extractor(con_length, pos_depend)
     for rule in filehandle:
-        phrase_pair = ' ||| '.join(rule.strip().split(' ||| ')[:2])
+        elements = rule.strip().split(' ||| ')
+        src_phrase = elements[0]
+        tgt_phrase = elements[1]
+        phrase_pair = ' ||| '.join(elements[:2])
+        if count_dict is not None:
+            tgt_counts = count_dict[src_phrase] if src_phrase in count_dict else {}
+            tgt_counts[tgt_phrase] = tgt_counts[tgt_phrase] + 1 if tgt_phrase in tgt_counts else 1
+            count_dict[src_phrase] = tgt_counts
         span = rule.strip().split(' ||| ')[2]
         tokens.add_token([phrase_pair])
         left_idx = int(span.split('-')[0])
@@ -66,34 +75,53 @@ def compute_cca(left_con, right_con, bidi_lowrank_con, tokens, rank):
     print cw_correlations
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'k:l:p')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'c:f:k:l:ps:r:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
     rank = 50
     pos_depend = False
+    filter_features = ""
+    filter_sw = ""
+    kappa = -1
+    count_dict = None
+    count_out_loc = ""
     for opt in opts:
         if opt[0] == '-l':
             con_length = int(opt[1])
-        elif opt[0] == '-k':
+        elif opt[0] == '-r':
             rank = int(opt[1])
         elif opt[0] == '-p': #position-dependent feature extraction
             pos_depend = True
-
+        elif opt[0] == '-f': #filter feature space; only consider words in this list
+            filter_features = opt[1]
+        elif opt[0] == '-s': #stop word filtering
+            filter_sw = opt[1]
+        elif opt[0] == '-k': #scale
+            kappa = float(opt[1])
+        elif opt[0] == '-c': #write out count dict
+            count_dict = {}
+            count_out_loc = opt[1]
     tokens = eigentype()
-    left_con = eigentype()
-    right_con = eigentype()
+    left_con = eigentype(filter_sw, filter_features)
+    right_con = eigentype(filter_sw, filter_features)
     bidi_lowrank_con = eigentype()    
     for count, line in enumerate(sys.stdin):
         source = line.strip().split(' ||| ')[0]
         phrase_pair_fh = gzip.open(phrase_pairs_loc + "/grammar.%d.gz"%count)
-        extract_tokens(phrase_pair_fh, source, tokens, left_con, right_con, con_length, pos_depend)
+        extract_tokens(phrase_pair_fh, source, tokens, left_con, right_con, con_length, pos_depend, count_dict)
         phrase_pair_fh.close()
+    if count_dict is not None:
+        cPickle.dump(count_dict, open(count_out_loc, "wb"))
+        print "Wrote counts to file %s"%count_out_loc
     tokens.create_sparse_matrix()
     left_con.create_sparse_matrix()
     right_con.create_sparse_matrix()
     print "Number of tokens: %d; Number of types: %d"%(tokens.token_mat.shape[0], tokens.token_mat.shape[1])
     print "Left context dimensionality: %d; Right context dimensionality: %d"%(left_con.token_mat.shape[1], right_con.token_mat.shape[1])
+    if kappa > 0: #rescaling requested; do we also rescale tokens? 
+        left_con.rescale_features(kappa)
+        right_con.rescale_features(kappa)
     compute_cca(left_con, right_con, bidi_lowrank_con, tokens, rank)
     paramDict = {}
     paramDict["left_con"] = left_con
