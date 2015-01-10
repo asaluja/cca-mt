@@ -101,14 +101,14 @@ def maxLexFgivenE(fwords, ewords, ttable):
         maxOffScore += -math.log10(maxScore) if maxScore > 0 else MAXSCORE
     return maxOffScore
 
-def computeLexicalScores(model_loc, rules_list):
+def computeLexicalScores(model_loc, rules_list, perSent):
     tt = cdec.sa.BiLex(from_binary=model_loc)    
     new_rules = []
     for rule in rules_list:
         new_rule = rule
         elements = rule.split(' ||| ')
-        srcPhrase = elements[0]
-        tgtPhrase = elements[1]
+        srcPhrase = elements[1] if perSent else elements[0]
+        tgtPhrase = elements[2] if perSent else elements[1]
         srcWords = srcPhrase.split()
         tgtWords = tgtPhrase.split()
         if len(srcWords) > 0: 
@@ -125,35 +125,38 @@ def computeLexicalScores(model_loc, rules_list):
 def decorateSentenceGrammar(minRule_file, out_file, lex_model, optDict):
     perSent = "perSentence" in optDict
     addOne = "addOne" in optDict
+    expr = re.compile(r'\[([^]]*)\]')
     numRulesTotal = 0
     if os.path.isfile(minRule_file):
         rules_output = []
         minrule_fh = gzip.open(minRule_file, 'rb')
-        for rule in minrule_fh:                                
+        for rule in minrule_fh:
             numRulesTotal += 1
             elements = rule.strip().split(' ||| ')
-            key = ' ||| '.join(elements[:2])
+            key = ' ||| '.join(elements[1:3]) if perSent else ' ||| '.join(elements[:2])
             ruleToPrint = rule.strip()
             if not perSent: #writing out full grammar, so strip alignment info
-                ruleToPrint = key + " ||| "
-            if elements[0] == "<unk>":
-                ruleToPrint = "%s ||| %s ||| %s PassThrough=1"%(elements[1], elements[1], elements[2]) if len(elements) > 2 else "%s ||| %s ||| PassThrough=1"%(elements[1], elements[1])
-            ruleToPrint += computeFeatures(key, addOne)
+                ruleToPrint = key + " ||| " #no LHS
+            if elements[1] == "<unk>": #only occurs from output of decoder, not grammar extractor
+                ruleToPrint = "%s ||| %s ||| %s ||| %s PassThrough=1"%(elements[0], elements[2], elements[2], elements[3])
+            else:
+                num_nts = len(expr.findall(key))
+                if num_nts == 0: #only if there are no NTs do we compute features
+                    ruleToPrint += computeFeatures(key, addOne)
             rules_output.append(ruleToPrint)
         minrule_fh.close()
         if perSent:
-            new_rules = computeLexicalScores(lex_model, rules_output)
-            out_fh = gzip.open(out_file, 'w')
+            new_rules = computeLexicalScores(lex_model, rules_output, perSent)
+            out_fh = gzip.open(out_file, 'wb')
             for ruleToPrint in new_rules:
                 out_fh.write("%s\n"%ruleToPrint)
+            #out_fh.write("[X] ||| [X,1] [X,2] ||| [1] [2] ||| Glue=1\n")
+            #out_fh.write("[X] ||| [X,1] [X,2] ||| [2] [1] ||| Glue=1 Inverse=1\n")            
+            #out_fh.write("[S] ||| [X,1] ||| [1] ||| 0\n") #no features defined on the top-level rule, just for parsing completion purposes
+            out_fh.close()            
         else:
             seen_rules.extend(rules_output) #global write
         print "Grammar %s featurization complete: %d rules"%(minRule_file, numRulesTotal)
-    if perSent: #add the NT only rules
-        out_fh.write("[X] ||| [X,1] [X,2] ||| [1] [2] ||| Glue=1\n")
-        out_fh.write("[X] ||| [X,1] [X,2] ||| [2] [1] ||| Glue=1 Inverse=1\n")            
-        out_fh.write("[S] ||| [X,1] ||| [1] ||| 0\n") #no features defined on the top-level rule, just for parsing completion purposes
-        out_fh.close()
 
 def init(sr):
     global seen_rules
@@ -188,7 +191,7 @@ def main():
     else:
         pool = mp.Pool(numProcesses)
     for minRule_file in minRule_grammars:
-        if numProcesses > 1:
+        if numProcesses > 1: #doesn't seem to work for per-sentence grammar case? 
             pool.apply_async(decorateSentenceGrammar, (minRule_grammars_loc + minRule_file, outFile_loc + minRule_file, lex_model, optDict))    
         else:
             decorateSentenceGrammar(minRule_grammars_loc + minRule_file, outFile_loc + minRule_file, lex_model, optDict)
@@ -199,7 +202,8 @@ def main():
         print "number of rules seen: %d"%len(seen_rules)
         output_fh = gzip.open(outFile_loc, 'wb')
         seen_rules_uniq = list(set(seen_rules))
-        new_rules = computeLexicalScores(lex_model, seen_rules_uniq)
+        new_rules = computeLexicalScores(lex_model, seen_rules_uniq, False)
+        print "computed lexical scores"
         if "filterRules" in optDict:
             filteredDict = filterRules(countDict, optDict["filterRules"])            
             for rule in new_rules:
@@ -207,13 +211,24 @@ def main():
                 srcKey = elements[0]
                 tgtKey = elements[1]
                 if tgtKey in filteredDict[srcKey]: #i.e., we haven't pruned it away
-                    output_fh.write("%s\n"%(rule))
+                    output_fh.write("[Xp] ||| %s\n"%(rule))
         else:
             for rule in new_rules:
-                output_fh.write("%s\n"%(rule))
-        output_fh.write("[X] ||| [X,1] [X,2] ||| [1] [2] ||| Glue=1\n")
-        output_fh.write("[X] ||| [X,1] [X,2] ||| [2] [1] ||| Glue=1 Inverse=1\n")        
-        output_fh.write("[S] ||| [X,1] ||| [1] ||| 0\n") #no features defined on the top-level rule, just for parsing completion purposes
+                output_fh.write("[Xp] ||| %s\n"%(rule))
+        output_fh.write("[Xn] ||| [Xn,1] [Xi,2] ||| [1] [2] ||| Glue=1 NI=1\n")
+        output_fh.write("[Xn] ||| [Xi,1] [Xi,2] ||| [1] [2] ||| Glue=1 II=1\n")
+        output_fh.write("[Xn] ||| [Xp,1] [Xi,2] ||| [1] [2] ||| Glue=1 PI=1\n")
+        output_fh.write("[Xn] ||| [Xn,1] [Xp,2] ||| [1] [2] ||| Glue=1 NP=1\n")
+        output_fh.write("[Xn] ||| [Xi,1] [Xp,2] ||| [1] [2] ||| Glue=1 IP=1\n")
+        output_fh.write("[Xn] ||| [Xp,1] [Xp,2] ||| [1] [2] ||| Glue=1 PP=1\n")
+        output_fh.write("[Xi] ||| [Xn,1] [Xn,2] ||| [2] [1] ||| Glue=1 Inverse=1 NN=1\n")
+        output_fh.write("[Xi] ||| [Xi,1] [Xn,2] ||| [2] [1] ||| Glue=1 Inverse=1 IN=1\n")
+        output_fh.write("[Xi] ||| [Xp,1] [Xn,2] ||| [2] [1] ||| Glue=1 Inverse=1 PN=1\n")
+        output_fh.write("[Xi] ||| [Xn,1] [Xp,2] ||| [2] [1] ||| Glue=1 Inverse=1 NP=1\n")
+        output_fh.write("[Xi] ||| [Xi,1] [Xp,2] ||| [2] [1] ||| Glue=1 Inverse=1 IP=1\n")
+        output_fh.write("[Xi] ||| [Xp,1] [Xp,2] ||| [2] [1] ||| Glue=1 Inverse=1 PP=1\n")
+        output_fh.write("[S] ||| [Xn,1] ||| [1] ||| 0\n") #no features defined on the top-level rule, just for parsing completion purposes
+        output_fh.write("[S] ||| [Xi,1] ||| [1] ||| 0\n") #no features defined on the top-level rule, just for parsing completion purposes
         output_fh.close()
 
 if __name__ == "__main__":

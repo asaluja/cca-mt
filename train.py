@@ -60,7 +60,7 @@ def matlab_interface(left_mat, right_mat, rank):
     return mat_return['A'].newbyteorder('='), mat_return['B'].newbyteorder('='), mat_return['r'].newbyteorder('=')
 
 def compute_cca(left_con, right_con, bidi_lowrank_con, tokens, rank): 
-    phi_l, phi_r, lr_correlations = matlab_interface(left_con.token_mat, right_con.token_mat, rank)
+    phi_l, phi_r, lr_correlations = matlab_interface(left_con.token_mat, right_con.token_mat, rank) #rank here should be different than final rank
     left_con.projection_mat = phi_l
     right_con.projection_mat = phi_r
     print "Correlations between left and right context: "
