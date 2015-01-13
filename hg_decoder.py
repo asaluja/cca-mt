@@ -1,8 +1,10 @@
 #!/usr/bin/python -tt
 
 '''
-File: intersect_scfg.py
-Date: December 13, 2013
+File: hg_decoder.py
+Date: January 8, 2015
+Author: Avneesh Saluja (avneesh@cs.cmu.edu)
+Based on compute_hg.py code in spectral-scfg package
 Description: modified version of bottom-up parser
 where we use a variant of CKY+, leveraging a trie 
 data structure of the grammar to come up with a hypergraph
@@ -10,22 +12,9 @@ representation of the composition of the input sentence
 FST and the grammar. The hypergraph is then converted
 to a grammar where NTs are indexed/decorated with their span.
 The grammar is written out in .gz files separated by sentence. 
-Downstream, io.py must read in and process the per-sentence grammar
-into a chart, after which the alpha and beta terms can be computed easily. 
-arg1: dictionary of parameters (output of feature extraction step)
-stdin: tokenized sentences
-Update: incorporated simple multicore setup.  Basically, we divide the input
-test corpus into partitions or chunks, and each process handles one partition. 
-Usage: python intersect_scfg.py (-d/f/n) SpectralParams SentencesToDecode NumPartitions Partition Rank OutDir
-Update: incorporated python's multiprocessing setup, much more efficient than the
-previous multiprocessing setup.  
-Usage: python intersect_scfg.py (-d/-f/-n) SpectralParams Rank InputFile NumProcesses outDir/
-Update (May 20,m 2014): renamed the directory from 'inside-outside' to 'parser', and also 
-renamed this file from 'intersect_scfg.py' to 'compute_hg.py'.  Changed writing out of the marginals,
-instead of log marginals previously we have raw marginals.  Also, there is now an option to write
-out multiple spectral marginals (normalized by source or target). 
-Lastly, included an additional option flag to generate heat maps of the parse chart. 
-Usage: python compute_hg.py (-d/-f/-n/-m/-s/-t) params rank input_sentences numProc outDir/
+arg0: dictionary of parameters (output of train.py step)
+arg1: output directory for per-sentence grammars
+arg2: number of processes to use for decoding
 '''
 
 import sys, commands, string, time, gzip, cPickle, re, getopt, math
@@ -77,7 +66,6 @@ def main():
     failed_sentences = mp.Manager().list()
     pool = mp.Pool(processes=num_process, initializer=init, initargs=(failed_sentences,))
     for sent_num, line in enumerate(sys.stdin):
-        #out_fh = gzip.open(output_dir + "/grammar.%d.gz"%sent_num, 'wb')
         out_filename = output_dir + "/grammar.%d.gz"%sent_num
         #parse(line.strip().split(), out_filename, sent_num)
         pool.apply_async(parse, (line.strip().split(), out_filename, sent_num))
@@ -139,7 +127,7 @@ def compute_scores(hg, words, out_filename):
         LHS = head.cat[:-1] + "_%d_%d]"%(left_idx, right_idx)
         if len(edge.tailNodes) == 0: #pre-terminal
             if edge.rule == "<unk>":
-                out_fh.write("%s ||| <unk> ||| %s ||| cca_off=1\n"%(LHS, words[left_idx]))
+                out_fh.write("%s ||| <unk> ||| %s ||| PassThrough=1\n"%(LHS, words[left_idx]))
             else:
                 applicable_rules = inventory[edge.rule]
                 left_con_words, right_con_words = extractor.extract_context(words, left_idx, right_idx-1)
@@ -156,15 +144,15 @@ def compute_scores(hg, words, out_filename):
                         scored_pps.append((phrase_pair, score))
                     sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True)
                     for pp, score in sorted_pps:
-                        out_fh.write("%s ||| %s ||| cca_on=1 cca_score=%.3f\n"%(LHS, pp, score))
+                        out_fh.write("%s ||| %s ||| cca_score=%.3f\n"%(LHS, pp, score))
                 else:
                     left_null = left_con_lr is None
                     null_context_side = "left" if left_null else "right"
                     null_context = ' '.join(left_con_words) if left_null else ' '.join(right_con_words)
-                    print "Phrase: '%s'; Context on %s ('%s') is completely OOV"%(' '.join(words[left_idx:right_idx]), null_context_side, null_context)
-                    for target_phrase in applicable_rules:
-                        phrase_pair = ' ||| '.join([edge.rule, target_phrase])
-                        out_fh.write("%s ||| %s ||| cca_off=1\n"%(LHS, phrase_pair))
+                    print "Phrase: '%s'; Context on %s ('%s') is completely OOV (this shouldn't happen!)"%(' '.join(words[left_idx:right_idx]), null_context_side, null_context)
+                    sys.exit()
+                if len(edge.rule.split()) == 1: #unigram
+                    out_fh.write("%s ||| %s ||| %s ||| PassThrough=1\n"%(LHS, edge.rule, edge.rule))
         else: #ITG rules
             src_decorated = decorate_src_rule(hg, edge.id)
             monotone = "[1] [2] ||| Glue=1"

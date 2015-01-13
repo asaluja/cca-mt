@@ -11,11 +11,13 @@ import numpy as np
 import scipy.sparse as sp
 
 class eigentype:
-    def __init__(self, stop_words = "", topN_features = ""):
+    def __init__(self, oov_cutoff = 0, stop_words = "", topN_features = ""):
         self.type_id_map = {}
         self._rows = []
         self._cols = []
         self._vals = []
+        self._cutoff = oov_cutoff
+        self._oov_map = {}
         self._counter = 0
         self.filter_stop = stop_words != ""
         self.stop_words = []
@@ -30,16 +32,29 @@ class eigentype:
             freq_fh = open(topN_features, 'rb')
             for line in freq_fh:
                 self.freq_features.append(line.strip())
+            freq_fh.close()
 
     def add_token(self, features):
-        for feature in features: #to do: check if we need to filter stopW or topN words
-            if self._check_feature_status(feature):
-                self._rows.append(self._counter)
-                feature_id = self.type_id_map[feature] if feature in self.type_id_map else len(self.type_id_map)
-                if feature not in self.type_id_map:
-                    self.type_id_map[feature] = feature_id
-                self._cols.append(feature_id)
-                self._vals.append(1.)
+        for feature in features:
+            if self._check_feature_status(feature): #if filter stop words or filter by most frequent words is enabled, this checks
+                if feature in self.type_id_map: #features make it here only after they exceed the oov cutoff, so we increment as normal
+                    self._rows.append(self._counter)
+                    self._cols.append(self.type_id_map[feature])
+                    self._vals.append(1.)
+                else: #either feature is in oov map or this is the first time we've seen this feature
+                    count, row_idxs = self._oov_map[feature] if feature in self._oov_map else (0, []) #pull up count and row_idxs, else assign init
+                    count += 1
+                    row_idxs.append(self._counter)
+                    if count > self._cutoff: #if cut off exceeded, add to seen features
+                        feature_id = len(self.type_id_map) #obtain feature ID
+                        self.type_id_map[feature] = feature_id
+                        for row_idx in row_idxs:
+                            self._rows.append(row_idx)
+                            self._cols.append(feature_id)
+                            self._vals.append(1.)
+                        self._oov_map.pop(feature, None) #and remove from potential OOV features (returns None if not there)
+                    else: #otherwise, add to OOV features
+                        self._oov_map[feature] = (count, row_idxs)
         self._counter += 1
 
     def get_tokens(self):
@@ -57,6 +72,16 @@ class eigentype:
             return status
 
     def create_sparse_matrix(self):
+        if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
+            print "Number of tokens <= oov cut-off %d: %d"%(self._cutoff, len(self._oov_map))
+            oov_feat_id = len(self.type_id_map)
+            self.type_id_map["<unk>"] = oov_feat_id
+            for low_freq_token in self._oov_map:
+                count, row_idxs = self._oov_map[low_freq_token]
+                for row_idx in row_idxs:
+                    self._rows.append(row_idx)
+                    self._cols.append(oov_feat_id)
+                    self._vals.append(1.)
         self.token_mat = sp.csr_matrix((self._vals, (self._rows, self._cols)), shape = (self._counter, len(self.type_id_map)))
 
     def project(self, input_mat):
@@ -79,6 +104,10 @@ class eigentype:
                 rowIDs.append(0)        
                 colIDs.append(self.type_id_map[feature])
                 vals.append(1.)
+            elif "<unk>" in self.type_id_map: #OOV parameter defined
+                rowIDs.append(0)
+                colIDs.append(self.type_id_map["<unk>"])
+                vals.append(1.)                
         if len(rowIDs) > 0:
             one_hot = sp.csr_matrix((vals, (rowIDs, colIDs)), shape = (1, len(self.type_id_map)))
             return self.project(one_hot)

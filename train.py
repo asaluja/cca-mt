@@ -35,7 +35,7 @@ def extract_tokens(filehandle, sentence, tokens, left_con, right_con, con_length
         elements = rule.strip().split(' ||| ')
         src_phrase = elements[0]
         tgt_phrase = elements[1]
-        phrase_pair = ' ||| '.join(elements[:2])
+        phrase_pair = ' ||| '.join([src_phrase, tgt_phrase])
         if count_dict is not None:
             tgt_counts = count_dict[src_phrase] if src_phrase in count_dict else {}
             tgt_counts[tgt_phrase] = tgt_counts[tgt_phrase] + 1 if tgt_phrase in tgt_counts else 1
@@ -75,7 +75,7 @@ def compute_cca(left_con, right_con, bidi_lowrank_con, tokens, rank):
     print cw_correlations
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'c:f:k:l:ps:r:')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'c:f:k:l:o:ps:r:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
@@ -84,6 +84,7 @@ def main():
     filter_features = ""
     filter_sw = ""
     kappa = -1
+    oov = 0 #cut-off for OOV handling
     count_dict = None
     count_out_loc = ""
     for opt in opts:
@@ -102,9 +103,11 @@ def main():
         elif opt[0] == '-c': #write out count dict
             count_dict = {}
             count_out_loc = opt[1]
+        elif opt[0] == '-o': #OOV handling
+            oov = int(opt[1])
     tokens = eigentype()
-    left_con = eigentype(filter_sw, filter_features)
-    right_con = eigentype(filter_sw, filter_features)
+    left_con = eigentype(oov, filter_sw, filter_features)
+    right_con = eigentype(oov, filter_sw, filter_features)
     bidi_lowrank_con = eigentype()    
     for count, line in enumerate(sys.stdin):
         source = line.strip().split(' ||| ')[0]

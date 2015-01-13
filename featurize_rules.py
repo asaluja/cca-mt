@@ -109,16 +109,18 @@ def computeLexicalScores(model_loc, rules_list, perSent):
         elements = rule.split(' ||| ')
         srcPhrase = elements[1] if perSent else elements[0]
         tgtPhrase = elements[2] if perSent else elements[1]
+        is_passthrough = elements[3] == "PassThrough=1"
         srcWords = srcPhrase.split()
         tgtWords = tgtPhrase.split()
-        if len(srcWords) > 0: 
-            f_given_e = maxLexFgivenE(srcWords, tgtWords, tt)     
-            if f_given_e < MAXSCORE:
-                new_rule += " MaxLexFgivenE=%.11f"%f_given_e
-        if len(tgtWords) > 0:
-            e_given_f = maxLexEgivenF(srcWords, tgtWords, tt)
-            if e_given_f < MAXSCORE:
-                new_rule += " MaxLexEgivenF=%.11f"%e_given_f
+        if not is_passthrough:
+            if len(srcWords) > 0: 
+                f_given_e = maxLexFgivenE(srcWords, tgtWords, tt)     
+                if f_given_e < MAXSCORE:
+                    new_rule += " MaxLexFgivenE=%.11f"%f_given_e
+            if len(tgtWords) > 0:
+                e_given_f = maxLexEgivenF(srcWords, tgtWords, tt)
+                if e_given_f < MAXSCORE:
+                    new_rule += " MaxLexEgivenF=%.11f"%e_given_f
         new_rules.append(new_rule)
     return new_rules            
 
@@ -138,10 +140,14 @@ def decorateSentenceGrammar(minRule_file, out_file, lex_model, optDict):
             if not perSent: #writing out full grammar, so strip alignment info
                 ruleToPrint = key + " ||| " #no LHS
             if elements[1] == "<unk>": #only occurs from output of decoder, not grammar extractor
-                ruleToPrint = "%s ||| %s ||| %s ||| %s PassThrough=1"%(elements[0], elements[2], elements[2], elements[3])
+                ruleToPrint = "%s ||| %s ||| %s ||| %s"%(elements[0], elements[2], elements[2], elements[3])
             else:
                 num_nts = len(expr.findall(key))
-                if num_nts == 0: #only if there are no NTs do we compute features
+                is_passthrough = False
+                if len(elements) > 3: 
+                    if elements[3] == "PassThrough=1": #write out as is
+                        is_passthrough = True
+                if num_nts == 0 and not is_passthrough: #only if there are no NTs and rule isn't pass-through do we compute features
                     ruleToPrint += computeFeatures(key, addOne)
             rules_output.append(ruleToPrint)
         minrule_fh.close()
