@@ -55,7 +55,7 @@ class trie:
                 nextNode = curNode.Extend(item)
                 curNode = nextNode
             curNode.addRule((LHS,RHS_src)) #once done, add rule to rule bin of current node   
-        self.root.addEdge("<unk>") #adding OOV token
+        self.root.addEdge("<unk>") #this <unk> is for parsing and not for context
         OOVNode = self.root.Extend("<unk>")
         OOVNode.addRule(("[X]","<unk>"))
     
