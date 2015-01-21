@@ -17,52 +17,34 @@ arg1: output directory for per-sentence grammars
 arg2: number of processes to use for decoding
 '''
 
-import sys, commands, string, time, gzip, re, getopt, math
-import pickle as cPickle
+import sys, commands, string, time, gzip, re, getopt, math, cPickle
 import multiprocessing as mp
 import numpy as np
 from trie import trie, ActiveItem, HyperGraph
-from eigentype import *
+from sparsecontainer import ContextExtractor
+from model import *
 
 '''
 do these as global variables because we want to share them amongst processes
 if we pass them to the threads, it makes things much slower. 
 '''
-(opts, args) = getopt.getopt(sys.argv[1:], 'R')
-conf = config(args[0])
+(opts, args) = getopt.getopt(sys.argv[1:], 'n')
+normalize = False
+for opt in opts:
+    if opt[0] == '-n':
+        normalize = True
+param_filename = args[0]
 output_dir = args[1]
 num_process = int(args[2])
-left_con = eigentype()
-left_con.read_from_file(conf.get_fileloc("left_con"))
-right_con = eigentype()
-right_con.read_from_file(conf.get_fileloc("right_con"))
-lowrank_con = eigentype()
-lowrank_con.read_from_file(conf.get_fileloc("lowrank_con"))
-tokens = eigentype()
-tokens.read_from_file(conf.get_fileloc("tokens"))
-phrase_pairs = ["[X] ||| " + pair for pair in tokens.get_tokens()]
+param_fh = open(param_filename, 'rb')
+model = cPickle.load(param_fh)
+extractor = cPickle.load(param_fh)
+param_fh.close()
+phrase_pairs = ["[X] ||| " + pair for pair in model.get_tokens()]
 phrase_pairs.append("[X] ||| [X,1] [X,2] ||| [1] [2]")
 phrase_pairs.append("[X] ||| [X,1] [X,2] ||| [2] [1]")
 grammar_trie = trie(phrase_pairs)
-extractor = cPickle.load(open(conf.get_fileloc("context_extractor"), 'rb'))
 print "Data structures from training stage loaded"
-
-regression = False
-for opt in opts:
-    if opt[0] == '-R':
-        regression = True
-
-def format_phrase_pairs(phrase_pairs):
-    phrase_dict = {}
-    for phrase_pair in phrase_pairs:
-        elements = phrase_pair.split(' ||| ')
-        src = elements[1]
-        tgt = elements[2]
-        translations = phrase_dict[src] if src in phrase_dict else []
-        translations.append(tgt)
-        phrase_dict[src] = translations
-    return phrase_dict
-inventory = format_phrase_pairs(phrase_pairs)
 
 '''
 declaration of list that maintains which sentences have failed across all processes
@@ -138,26 +120,25 @@ def compute_scores(hg, words, out_filename):
             if edge.rule == "<unk>": #this is <unk> in the phrase pair sense, not <unk> in the context sense
                 out_fh.write("%s ||| <unk> ||| %s ||| PassThrough=1\n"%(LHS, words[left_idx]))
             else:
-                applicable_rules = inventory[edge.rule]
                 left_con_words, right_con_words = extractor.extract_context(words, left_idx, right_idx-1)
-                left_con_lr = left_con.get_representation(left_con_words) #closest context is last
-                right_con_lr = right_con.get_representation(right_con_words) #closest context is first
+                left_con_lr, right_con_lr = model.get_context_representation(left_con_words, right_con_words)
                 if left_con_lr is not None and right_con_lr is not None:
                     concat_con_lr = np.concatenate((left_con_lr, right_con_lr), axis=1)
-                    #at this stage, if model is regression, handle with regression scorer, else with kNN scorer
-                    scored_pps = score_regression(concat_con_lr, edge.rule, applicable_rules, tokens) if regression else score_kNN(concat_con_lr, lowrank_con, edge.rule, applicable_rules, tokens)
+                    scored_pps = model.score(concat_con_lr, edge.rule)
+                    if normalize:
+                        normalizer = sum([score for pp,score in scored_pps])
+                        scored_pps = [(pp, score/normalizer) for pp,score in scored_pps]
                     sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True)
                     for pp, score in sorted_pps:
-                        #out_fh.write("%s ||| %s ||| cca_on=1 cca_score=%.3f\n"%(LHS, pp, score))
                         out_fh.write("%s ||| %s ||| cca_score=%.3f\n"%(LHS, pp, score))
-                else: #this occurs if all context words are stop words or no OOV flag was provided in training
+                else: #this occurs if all context words are stop words
                     left_null = left_con_lr is None
                     null_context_side = "left" if left_null else "right"
                     null_context = ' '.join(left_con_words) if left_null else ' '.join(right_con_words)
-                    print "WARNING: Phrase: '%s'; Context on %s ('%s') was filtered; either all context words are stop words or no <unk> token defined\n"%(' '.join(words[left_idx:right_idx]), null_context_side, null_context)
-                    for target_phrase in applicable_rules:
+                    print "WARNING: Phrase: '%s'; Context on %s ('%s') was filtered; either all context words are stop words.\n"%(' '.join(words[left_idx:right_idx]), null_context_side, null_context)
+                    for target_phrase in applicable_rules: #is this a good thing to do by default? 
                         phrase_pair = ' ||| '.join([edge.rule, target_phrase])
-                        out_fh.write("%s ||| %s ||| cca_off=1\n"%(LHS, phrase_pair))
+                        out_fh.write("%s ||| %s ||| cca_score=0\n"%(LHS, phrase_pair))
                 if len(edge.rule.split()) == 1: #unigram, so write pass-through to be compatible with cdec
                     out_fh.write("%s ||| %s ||| %s ||| PassThrough=1\n"%(LHS, edge.rule, edge.rule))
         else: #ITG rules
@@ -165,33 +146,9 @@ def compute_scores(hg, words, out_filename):
             monotone = "[1] [2] ||| Glue=1"
             inverse = "[2] [1] ||| Glue=1 Inverse=1"
             out_fh.write("%s ||| %s ||| %s\n"%(LHS, src_decorated, monotone))
-            out_fh.write("%s ||| %s ||| %s\n"%(LHS, src_decorated, inverse))            
+            out_fh.write("%s ||| %s ||| %s\n"%(LHS, src_decorated, inverse))
     out_fh.write("[S] ||| [X_0_%d] ||| [1] ||| 0\n"%len(words)) #top level rule
     out_fh.close()
-
-def score_regression(context_rep, src_rule, applicable_rules, tokens):
-    aug_context_rep = np.concatenate((context_rep, [1]), axis=1) #for offset
-    predict_vec = tokens.project(aug_context_rep) #1xh, where h is all possible phrase pairs
-    scored_pps = []
-    normalizer = 0
-    for target_phrase in applicable_rules:
-        phrase_pair = ' ||| '.join([src_rule, target_phrase])
-        colID = tokens.get_tokenID(phrase_pair)        
-        score = predic_vec[1,colID] #select just the score for the phrase pair
-        normalizer += score
-        scored_pps.append((phrase_pair, score))
-    norm_scored_pps = [(pp, score/normalizer) for pp, score in scored_pps] #normalize by the scores of phrase pairs with source
-    return norm_scored_pps
-
-def score_kNN(context_rep, lowrank_con, src_rule, applicable_rules, tokens):
-    bidi_con_lr = lowrank_con.project(context_rep)
-    scored_pps = []
-    for target_phrase in applicable_rules:
-        phrase_pair = ' ||| '.join([src_rule, target_phrase])
-        representation = tokens.get_representation([phrase_pair])
-        score = representation.dot(bidi_con_lr.transpose()) / (np.linalg.norm(representation)*np.linalg.norm(bidi_con_lr))
-        scored_pps.append((phrase_pair, score))
-    return scored_pps
 
 def decorate_src_rule(hg, inEdgeID):
     expr = re.compile(r'\[([^]]*)\]')

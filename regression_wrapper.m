@@ -4,6 +4,6 @@ tic;
 beta = linear_regression(X, Y, str2num(reg));
 timeTaken = toc;
 save(file_loc, 'beta');
-fprintf('Time taken for regression: %.3f sec\n', timeTaken); 
+fprintf('Time taken for normal equations: %.1f sec\n', timeTaken); 
 exit
 

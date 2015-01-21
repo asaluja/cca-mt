@@ -17,11 +17,11 @@ Cxx = X'*X;
 Cyy = Y'*Y;
 Cxy = X'*Y;
 if issparse(X) %regularizer: depends on sparse/dense
-    Cxx = Cxx + gamma*speye(p1, p1);
-    Cyy = Cyy + gamma*speye(p2, p2);
+    Cxx = Cxx + gamma.*speye(p1, p1);
+    Cyy = Cyy + gamma.*speye(p2, p2);
 else
-    Cxx = Cxx + gamma*eye(p1, p1);
-    Cyy = Cyy + gamma*eye(p2, p2);
+    Cxx = Cxx + gamma.*eye(p1, p1);
+    Cyy = Cyy + gamma.*eye(p2, p2);
 end
 
 %below code unsparsifies the matrix, but Cxx and Cyy are relatively smaller

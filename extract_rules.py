@@ -18,9 +18,10 @@ STDIN: normalized decomposition trees (from the output of the Zhang et al. minim
 Options:
 -m X: adjust the maximum length of a phrase extracted (default is 6)
 -l: extract lexical translations instead of phrase pairs. STDIN is ignored in this setting. 
+January 20, 2015: updated and added counts dictionary writing here (for downstream feature computation).  
 '''
 
-import sys, commands, string, collections, gzip, re, getopt
+import sys, commands, string, collections, gzip, re, getopt, cPickle
 
 class sexp_parser:
     '''empty initializer'''
@@ -137,31 +138,41 @@ class minimal_tree:
                     tgt_rule.append(item)
             return ' '.join(src_rule), ' '.join(tgt_rule)
 
-    def printTree(self, output_fh, max_length):
+    def printTree(self, output_fh, max_length, count_dict):
         if self.lex:
             start_idx, end_idx = self.source_span
             span_length = end_idx - start_idx + 1
             if span_length <= max_length:
                 if len(self.children) == 0: #pre-terminal
                     output_fh.write("%s ||| %d-%d\n"%(self.rule, start_idx, end_idx))
+                    src_phrase, tgt_phrase = self.rule.split(' ||| ')
+                    add_to_count_dict(count_dict, src_phrase, tgt_phrase)
                 else: #lexical item in a rule with non-terminals
                     src_rule, tgt_rule = self.returnYield()
                     output_fh.write("%s ||| %s ||| %d-%d\n"%(src_rule, tgt_rule, start_idx, end_idx))
+                    add_to_count_dict(count_dict, src_rule, tgt_rule)
         for child in self.children:
-            child.printTree(output_fh, max_length)
+            child.printTree(output_fh, max_length, count_dict)
 
-def printLexicalPairs(filehandle, alignmentDict, srcWords, tgtWords):
+def add_to_count_dict(counts, src_phrase, tgt_phrase):
+    tgt_counts = counts[src_phrase] if src_phrase in counts else {}
+    tgt_counts[tgt_phrase] = tgt_counts[tgt_phrase] + 1 if tgt_phrase in tgt_counts else 1
+    counts[src_phrase] = tgt_counts
+
+def printLexicalPairs(filehandle, alignmentDict, srcWords, tgtWords, count_dict):
     for src_idx in alignmentDict:
         translation = []
         for tgt_idx in alignmentDict[src_idx]: #to handle one-to-many alignments
             translation.append(tgtWords[tgt_idx])
         filehandle.write("%s ||| %s ||| %d-%d\n"%(srcWords[src_idx], ' '.join(translation), src_idx, src_idx))
+        add_to_count_dict(count_dict, srcWords[src_idx], ' '.join(translation))
 
 def main():
     (opts, args) = getopt.getopt(sys.argv[1:], 'lm:')    
     corpus = open(args[0], 'r').read().splitlines()
     alignments = open(args[1], 'r').read().splitlines()
     output_dir = args[2]
+    counts_out = args[3]
     max_length = 6
     lex = False
     for opt in opts:
@@ -170,6 +181,7 @@ def main():
         elif opt[0] == '-l':
             lex = True
     data = alignments if lex else sys.stdin
+    count_dict = {}
     for counter,line in enumerate(data): 
         src, tgt = corpus[counter].split(' ||| ')
         alignment = collections.defaultdict(list)
@@ -180,11 +192,14 @@ def main():
         out_loc = output_dir + "/grammar.%d.gz"%(counter)
         out_fh = gzip.open(out_loc, 'wb')
         if lex:
-            printLexicalPairs(out_fh, alignment, src.split(), tgt.split())
+            printLexicalPairs(out_fh, alignment, src.split(), tgt.split(), count_dict)
         else:
             derivation_tree = minimal_tree(src.split(), tgt.split(), alignment, line.rstrip().lstrip())
-            derivation_tree.printTree(out_fh, max_length)
+            derivation_tree.printTree(out_fh, max_length, count_dict)
         out_fh.close()
+    count_fh = open(counts_out, 'wb')
+    cPickle.dump(count_dict, count_fh)
+    count_fh.close()
 
 if __name__ == "__main__":
     main()
