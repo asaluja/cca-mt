@@ -120,14 +120,14 @@ def compute_scores(hg, words, out_filename):
             if edge.rule == "<unk>": #this is <unk> in the phrase pair sense, not <unk> in the context sense
                 out_fh.write("%s ||| <unk> ||| %s ||| PassThrough=1\n"%(LHS, words[left_idx]))
             else:
-                left_con_words, right_con_words = extractor.extract_context(words, left_idx, right_idx-1)
-                left_con_lr, right_con_lr = model.get_context_representation(left_con_words, right_con_words)
+                left_con_words, right_con_words = extractor.extract_context(words, left_idx, right_idx-1) #same as before, either real-valued arrays or lists of words
+                left_con_lr, right_con_lr = model.get_context_rep_vec(left_con_words, right_con_words) if extractor.is_repvec() else model.get_context_rep(left_con_words, right_con_words)
                 if left_con_lr is not None and right_con_lr is not None:
                     concat_con_lr = np.concatenate((left_con_lr, right_con_lr), axis=1)
                     scored_pps = model.score(concat_con_lr, edge.rule)
                     if normalize:
                         normalizer = sum([score for pp,score in scored_pps])
-                        scored_pps = [(pp, score/normalizer) for pp,score in scored_pps]
+                        scored_pps = [(pp, score/normalizer) for pp,score in scored_pps] if normalizer != 0 else [(pp, 0) for pp,score in scored_pps]
                     sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True)
                     for pp, score in sorted_pps:
                         out_fh.write("%s ||| %s ||| cca_score=%.3f\n"%(LHS, pp, score))
@@ -135,7 +135,7 @@ def compute_scores(hg, words, out_filename):
                     left_null = left_con_lr is None
                     null_context_side = "left" if left_null else "right"
                     null_context = ' '.join(left_con_words) if left_null else ' '.join(right_con_words)
-                    print "WARNING: Phrase: '%s'; Context on %s ('%s') was filtered; either all context words are stop words.\n"%(' '.join(words[left_idx:right_idx]), null_context_side, null_context)
+                    print "WARNING: Phrase: '%s'; Context on %s ('%s') was filtered; all context words are stop words.\n"%(' '.join(words[left_idx:right_idx]), null_context_side, null_context)
                     for target_phrase in applicable_rules: #is this a good thing to do by default? 
                         phrase_pair = ' ||| '.join([edge.rule, target_phrase])
                         out_fh.write("%s ||| %s ||| cca_score=0\n"%(LHS, phrase_pair))

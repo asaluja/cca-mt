@@ -24,6 +24,7 @@ maps between type strings and IDs
 class SparseContainer(object):
     def __init__(self, oov_cutoff = 0):
         self.type_id_map = {} #read/write DS
+        self.id_type_map = {} #held-out eval
         self._rows = []
         self._cols = []
         self._vals = []
@@ -49,6 +50,7 @@ class SparseContainer(object):
                 if count > self._cutoff: #if cut off exceeded, add to seen features
                     feature_id = len(self.type_id_map) #obtain feature ID
                     self.type_id_map[feature] = feature_id
+                    self.id_type_map[feature_id] = feature
                     for row_idx in row_idxs:
                         self._rows.append(row_idx)
                         self._cols.append(feature_id)
@@ -77,16 +79,35 @@ class SparseContainer(object):
     def get_type_map(self):
         return self.type_id_map
 
-    def get_token_matrix(self):
+    def get_token_matrix(self, subset_idxs=None):
         if self.token_matrix is not None:
-            return self.token_matrix
+            if subset_idxs is None:
+                return self.token_matrix
+            else:
+                return self.token_matrix[subset_idxs,:]
         else:
             sys.stderr.write("ERROR! Token matrix has not been estimated or set; returning None\n")
             return None
 
+    def get_token_phrase(self, token_id):
+        if token_id in self.id_type_map:
+            return self.id_type_map[token_id]
+        else:
+            sys.stderr.write("ERROR! Provided ID not in map!\n")
+
+
 class SparseContext(SparseContainer):
     def __init__(self, oov_cutoff = 0):
         super(SparseContext, self).__init__(oov_cutoff) #initializing the parent parameters
+    
+    '''
+    ignores OOVs, etc. 
+    '''
+    def add_token_vec(self, rep):
+        self._vals.append(rep)
+
+    def create_dense_matrix(self): 
+        self.token_matrix = np.vstack(self._vals)
 
     def create_sparse_matrix(self, pos_depend, con_length):
         if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
@@ -121,10 +142,15 @@ class SparseContext(SparseContainer):
 
 class ContextExtractor:
     '''constructor that takes into account context window size, position dependence, and any filtering required'''
-    def __init__(self, con_length, pos_depend, stop_words, topN_features):
+    def __init__(self, con_length, pos_depend, stop_words, topN_features, vecs_filename):
         self.con_length = con_length
         self.pos_depend = pos_depend
-        self.filter_stop = stop_words != ""
+        self.vec_dim = 0
+        self.rep_dict = None
+        if vecs_filename != "": #reads in word vectors if defined
+            self.rep_dict = self.read_vectors(vecs_filename)
+            self.vec_dim = len(self.rep_dict[self.rep_dict.keys()[0]])
+        self.filter_stop = stop_words != ""        
         self.stop_words = []
         self.filter_features = topN_features != ""
         self.freq_features = []
@@ -139,6 +165,21 @@ class ContextExtractor:
                 self.freq_features.append(line.strip())
             freq_fh.close()
 
+    def read_vectors(self, filename):
+        fh = open(filename, 'r')
+        vecs = {}
+        for line in fh:
+            if len(line.strip().split()) > 2:
+                word = line.strip().split()[0]
+                rep = np.array([float(i) for i in line.strip().split()[1:]])
+                vec_len = np.linalg.norm(rep)
+                vecs[word] = np.divide(rep, vec_len) if vec_len > 0 else np.zeros(len(rep))
+        fh.close()
+        return vecs
+
+    def is_repvec(self):
+        return self.vec_dim > 0
+
     '''
     function that extracts the context of a phrase (given left and right indices of its span)
     from a sentence provided as a list.  The function does the required checks if stop-word 
@@ -152,33 +193,60 @@ class ContextExtractor:
         left_con_words = []
         while left_con_idx < left_idx:
             if left_con_idx < 0:
-                left_con_words.append("<s>") #start of sentence marker
+                word_to_add = np.zeros((self.vec_dim,)) if self.vec_dim > 0 else "<s>"
+                left_con_words.append(word_to_add)
                 left_con_idx = 0 #skip to beginning of sentence
             else:
                 context_word = sentence_items[left_con_idx]
                 if not self.filter_stop or not context_word in self.stop_words: #if not checking for sw, or if checking, context is not in sw
                     if self.filter_features and context_word not in self.freq_features: #if checking for listed featureds and context not in list
-                        context_word = "<OTHER>" #then replace with other
-                    if self.pos_depend: #decorate with distance from word if position dependent
+                        context_word = "<OTHER>" #then replace with other --> assumption is filter_features and wordvecs cannot be both true
+                    if self.pos_depend and self.vec_dim == 0: #decorate with distance from word if position dependent and we're not using wordvecs
                         context_word += "_dist%d"%(left_idx-left_con_idx)
+                    if self.vec_dim > 0: #using word vectors
+                        rep = self.rep_dict[context_word] if context_word in self.rep_dict else np.zeros((self.vec_dim,))
+                        context_word = rep
                     left_con_words.append(context_word) 
                 left_con_idx += 1 #skips if its a stop word
+
         right_con_idx = right_idx + 1
         right_con_words = []
         while right_con_idx < right_idx + self.con_length + 1: #right side; symmetric to left
             if right_con_idx >= len(sentence_items):
-                right_con_words.append("</s>")
+                word_to_add = self.rep_dict["</s>"] if self.vec_dim > 0 else "</s>"                    
+                right_con_words.append(word_to_add)
                 break
             else:
                 context_word = sentence_items[right_con_idx]
                 if not self.filter_stop or not context_word in self.stop_words:
                     if self.filter_features and context_word not in self.freq_features:
                         context_word = "<OTHER>"                        
-                    if self.pos_depend:
+                    if self.pos_depend and self.vec_dim == 0:
                         context_word += "_dist%d"%(right_con_idx-right_idx)  
+                    if self.vec_dim > 0:
+                        rep = self.rep_dict[context_word] if context_word in self.rep_dict else np.zeros((self.vec_dim,))
+                        context_word = rep
                     right_con_words.append(context_word)
                 right_con_idx += 1
-        return left_con_words, right_con_words
+
+        if self.vec_dim > 0 and self.pos_depend: #concatenate the vectors            
+            if len(left_con_words) < self.con_length: #check if we need to zero-pad
+                diff = self.con_length - len(left_con_words)
+                for dummy in range(diff):
+                    left_con_words.append(np.zeros((self.vec_dim,)))
+            concat_left = np.hstack(left_con_words)
+            if len(right_con_words) < self.con_length: #correspondingly on right
+                diff = self.con_length - len(right_con_words)
+                for dummy in range(diff):
+                    right_con_words.append(np.zeros((self.vec_dim,)))
+            concat_right = np.hstack(right_con_words)
+            return concat_left, concat_right
+        elif self.vec_dim > 0:
+            sum_left = np.sum(np.vstack(left_con_words), axis=0)
+            sum_right = np.sum(np.vstack(right_con_words), axis=0)
+            return sum_left, sum_right
+        else:
+            return left_con_words, right_con_words
 
 class config:
     '''constructor reads in config parameters from file'''

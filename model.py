@@ -1,10 +1,11 @@
 #!/usr/bin/python -tt
 
-import sys, commands, string, os
+import sys, commands, string, os, time
 import numpy as np
 import scipy.sparse as sp
 import scipy.io as io
-from mlp import MLPClassifier
+from scipy.special import expit
+from mlp.mlp import MLPClassifier
 
 '''
 for CCA computations: X - left matrix, Y - right matrix, param - rank
@@ -28,8 +29,8 @@ def matlab_interface(X, Y, option, reg_strength, rank = 50):
         return mat_return['beta'].newbyteorder('=')
 
 class Context:
-    def __init__(self, left_context, right_context, gamma, rank, concat=False, con_length = 2):
-        phi_l, phi_r, lr_correlations = matlab_interface(left_context.get_token_matrix(), right_context.get_token_matrix(), "CCA", gamma, rank)
+    def __init__(self, left_context, right_context, gamma, rank, concat=False, con_length = 2, train_idxs=None):
+        phi_l, phi_r, lr_correlations = matlab_interface(left_context.get_token_matrix(train_idxs), right_context.get_token_matrix(train_idxs), "CCA", gamma, rank)
         self.left_proj_mat = phi_l
         self.right_proj_mat = phi_r
         self.left_map = left_context.get_type_map()
@@ -58,7 +59,7 @@ class Context:
                 for row,col in zip(rows, cols):
                     lowrank_mat_right[rowIdx, counter*num_features:(counter+1)*num_features] = self.right_proj_mat[col,:]
                     counter += 1
-        else:
+        else: #guaranteed that if word vectors are active concat is not active
             lowrank_mat_left = train_mat_left.dot(self.left_proj_mat)
             lowrank_mat_right = train_mat_right.dot(self.right_proj_mat)
         return lowrank_mat_left, lowrank_mat_right
@@ -91,6 +92,11 @@ class Context:
     def get_representation(self, features_left, features_right):
         left_context_rep = self.__get_representation_side(features_left, self.left_map, self.left_proj_mat)
         right_context_rep = self.__get_representation_side(features_right, self.right_map, self.right_proj_mat)
+        return left_context_rep, right_context_rep
+
+    def get_rep_vec(self, vec_left, vec_right):
+        left_context_rep = vec_left.dot(self.left_proj_mat)
+        right_context_rep = vec_right.dot(self.right_proj_mat)
         return left_context_rep, right_context_rep
 
 class BaseModel(object):
@@ -126,8 +132,11 @@ class BaseModel(object):
             sys.stderr.write("ERROR! Token %s not in inventory\n"%token)
             return None
 
-    def get_context_representation(self, con_left, con_right):
+    def get_context_rep(self, con_left, con_right):
         return self.context.get_representation(con_left, con_right)
+
+    def get_context_rep_vec(self, vec_left, vec_right):
+        return self.context.get_rep_vec(vec_left, vec_right)
 
     def get_indexed_scores(self, phrase, vec):
         translations = self.inventory[phrase]
@@ -135,17 +144,29 @@ class BaseModel(object):
         for translation in translations:
             phrase_pair = ' ||| '.join([phrase, translation])
             score = vec[self.get_tokenID(phrase_pair)]
+            if score < 0:
+                score = 0
             scored_pairs.append((phrase_pair, score))
         return scored_pairs
+
+    def get_candidate_indices(self, phrase):
+        translations = self.inventory[phrase]
+        idxs = []
+        phrase_pairs = []
+        for translation in translations:
+            phrase_pair = ' ||| '.join([phrase, translation])
+            idxs.append(self.get_tokenID(phrase_pair))
+            phrase_pairs.append(phrase_pair)
+        return idxs, phrase_pairs
 
 class CCA(BaseModel):
     def __init__(self, context, type_map):
         super(CCA, self).__init__(type_map, context)
         self.context_parameters = None
 
-    def train(self, left_low_rank, right_low_rank, tokens, gamma, rank):
+    def train(self, left_low_rank, right_low_rank, tokens, gamma, rank, train_idxs=None):
         training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
-        phi_s, phi_w, cw_correlations = matlab_interface(training_data, tokens.get_token_matrix(), "CCA", gamma, rank)
+        phi_s, phi_w, cw_correlations = matlab_interface(training_data, tokens.get_token_matrix(train_idxs), "CCA", gamma, rank)
         self.context_parameters = phi_s
         self.parameters = phi_w
         print "Two-step CCA complete. Correlations between combined context and tokens (with rank %d): "%rank
@@ -160,39 +181,93 @@ class CCA(BaseModel):
             phrase_pair = ' ||| '.join([phrase, translation])
             representation = self.get_representation(phrase_pair)
             score = representation.dot(bidi_con_rep.transpose()) / (np.linalg.norm(representation)*bidi_con_rep_norm)
+            if score < 0:
+                score = 0
             scored_pairs.append((phrase_pair, score))
         return scored_pairs
 
 class GLM(BaseModel):
     def __init__(self, context, tokens_map):
         super(GLM, self).__init__(tokens_map, context)
+        self.alphas = None
 
-    def train(self, left_low_rank, right_low_rank, tokens, gamma):
-        offset = np.ones((left_low_rank.shape[0], 1))
+    def train(self, left_low_rank, right_low_rank, tokens, gamma, train_idxs=None):
+        offset = np.ones((left_low_rank.shape[0], 1))        
         training_data = np.concatenate((left_low_rank, right_low_rank, offset), axis=1) #if each low-rank context is p-dim, then this is a 2p+1 dim vec
-        self.parameters = matlab_interface(training_data, tokens.get_token_matrix(), "regression", gamma)
+        self.parameters = matlab_interface(training_data, tokens.get_token_matrix(train_idxs), "regression", gamma)
         print "Fitted general linear model: %d responses %d predictors, %d samples"%(self.parameters.shape[1], self.parameters.shape[0], left_low_rank.shape[0])
 
     def score(self, context_rep, phrase): 
+        col_idxs, phrase_pairs = self.get_candidate_indices(phrase)
         aug_context_rep = np.append(context_rep, np.ones((1,)), axis=1)
-        predict_vec = aug_context_rep.dot(self.parameters) #1xh vector
-        return self.get_indexed_scores(phrase, predict_vec)
+        if self.alphas is not None: #then element-wise multiply with alpha vec
+            assert self.alphas.shape == aug_context_rep.shape
+            aug_context_rep *= self.alphas
+        predict_vec = aug_context_rep.dot(self.parameters[:,col_idxs])
+        #predict_vec = expit(predict_vec) #for sigmoid
+        scored_pps = []
+        for real_idx, phrase_pair in enumerate(phrase_pairs): #phrase_pairs is in the same order as col_idxs
+            score = predict_vec[real_idx]
+            if score < 0:
+                score = 0
+            scored_pps.append((phrase_pair, score))
+        return scored_pps
 
-    #to do: write shrinkage part
+    '''
+    shrinkage
+    '''
+    def shrink_estimates(self, left_low_rank, right_low_rank, tokens, heldout_idxs): 
+        labels = tokens.get_token_matrix(heldout_idxs)
+        assert left_low_rank.shape[0] == right_low_rank.shape[0] == labels.shape[0]
+        num_samples = left_low_rank.shape[0]
+        offset = np.ones((left_low_rank.shape[0], 1))
+        heldout_data = np.concatenate((left_low_rank, right_low_rank, offset), axis=1)
+        start = time.clock()
+        training_data = [[] for i in range(heldout_data.shape[1])] #list of p lists, where p is # of cols of heldout_data
+        Y = []
+        for idx in xrange(num_samples):
+            rows, cols = labels[idx,:].nonzero()
+            assert len(cols) == 1
+            phrase_id = cols[0]
+            phrase_pair = tokens.get_token_phrase(phrase_id)
+            src_phrase = phrase_pair.split(' ||| ')[0]
+            translation_idxs, dummy = self.get_candidate_indices(src_phrase) #phrase_id is in translation_idxs --> get other candidates
+            ans_idx = translation_idxs.index(phrase_id)
+            one_hot = np.zeros((len(translation_idxs),))
+            one_hot[ans_idx] = 1.
+            Y.append(one_hot)
+            context_rep = heldout_data[idx,:]
+            for j in xrange(len(context_rep)): #features are indexed by j
+                beta_jk_vec = self.parameters[j,translation_idxs] #returns 1xh2 vec, where h2 is len(translation_idxs)
+                scaled_beta = context_rep[j]*beta_jk_vec #element-wise mulitplication
+                training_data[j].append(scaled_beta) #append as training data
+        Y_all = np.concatenate(Y, axis=1)
+        print "Training data size for shrinkage estimation: %d"%Y_all.shape[0]
+        alphas = []
+        for feat_vals in training_data: #each 'feat_vals' is a list of beta_jk * x_j column vectors for each j
+            X = np.concatenate(feat_vals, axis=1)
+            assert X.shape == Y_all.shape
+            alpha_j = (1./np.dot(X, X))*np.dot(X,Y_all) #alpha computation via normal equations (OLS)
+            alphas.append(alpha_j)
+        self.alphas = np.array(alphas)
+        print "Shrinkage complete. Time taken: %.3f"%(time.clock()-start)
+        print self.alphas
 
 class MLP(BaseModel):
-    def __init__(self, context, tokens_map, rank): #there will be other params for the MLP
-        super(GLM, self).__init__(tokens_map, context)
-        self.mlp = MLPClassifier(n_hidden=rank, verbose=1) #set batch size
+    def __init__(self, context, tokens_map, gamma, rank): #there will be other params for the MLP
+        super(MLP, self).__init__(tokens_map, context)
+        self.mlp = MLPClassifier(n_hidden=rank, verbose=1, lr=gamma) #set batch size
     
-    def train(self, left_low_rank, right_low_rank, tokens):
+    def train(self, left_low_rank, right_low_rank, tokens, train_idxs=None):
         training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
         start = time.clock()
-        mlp.fit(training_data, tokens.get_token_matrix())
+        self.mlp.fit(training_data, tokens.get_token_matrix(train_idxs))
         print "MLP learning complete; input layer size: %d; hidden layer size: %d; output layer size: %d; time taken: %.1f sec"%(training_data.shape[1], self.mlp.n_hidden, tokens.get_token_matrix().shape[1], time.clock()-start)
         
     def score(self, context_rep, phrase):
-        predict_vec = self.mlp.predict(context_rep)
+        predict_vec = self.mlp.predict(context_rep)        
+        if predict_vec.shape[0] == 1: #single row vector
+            predict_vec = np.reshape(predict_vec, (predict_vec.shape[1],))
         return self.get_indexed_scores(phrase, predict_vec)
 
 
