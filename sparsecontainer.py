@@ -108,6 +108,7 @@ class SparseContext(SparseContainer):
 
     def create_dense_matrix(self): 
         self.token_matrix = np.vstack(self._vals)
+        self.token_matrix -= np.divide(self.token_matrix.sum(axis=0), self.token_matrix.shape[0])
 
     def create_sparse_matrix(self, pos_depend, con_length):
         if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
@@ -130,15 +131,6 @@ class SparseContext(SparseContainer):
                     self._cols.append(oov_feat_id)
                     self._vals.append(1.)
         self.token_matrix = sp.csr_matrix((self._vals, (self._rows, self._cols)), shape = (self._counter, len(self.type_id_map)))
-
-    def rescale_features(self, factor):
-        var_approx = self.token_matrix.transpose(copy=True)
-        var_approx.data **= 2
-        scale_denom = var_approx.sum(axis=1) + factor
-        scale_vec = np.sqrt((self._counter -1) * np.reciprocal(scale_denom))
-        scale_vec_sp = sp.spdiags(scale_vec.flatten(), [0], len(scale_vec), len(scale_vec))
-        self.token_matrix = self.token_matrix.dot(scale_vec_sp)
-        
 
 class ContextExtractor:
     '''constructor that takes into account context window size, position dependence, and any filtering required'''

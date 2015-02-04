@@ -61,6 +61,7 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model, me
     start = time.clock()    
     heldout_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
     eval_metric = 0
+    count = 0
     for idx, test_idx in enumerate(heldout_idxs):
         rows, cols = tokens.get_token_matrix()[test_idx,:].nonzero()
         assert len(cols) == 1 #since this is the tokens data, there should only be one non-zero per row
@@ -68,29 +69,18 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model, me
         phrase_pair = tokens.get_token_phrase(phrase_id)
         src_phrase = phrase_pair.split(' ||| ')[0]
         scored_pps = model.score(heldout_data[idx,:], src_phrase)
-        if method == "cca":
-            sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #sort by rank
+        if len(scored_pps) > 1: #only score non-singletons
+            sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #sort by score to get rank
             scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0]
             eval_metric += 1./scored_rank
-        else:
-            #score = [score for pp,score in scored_pps if pp == phrase_pair][0] #when using logistic - just do this for score - no normalization
-            normalizer = sum([score for pp,score in scored_pps])
-            score = 0
-            if normalizer == 0: #this occurs when src phrase only exists in held-out - in such a case, score all options equally
-                score = 1./len(scored_pps)
-            else:
-                norm_pps = [(pp, score/normalizer) for pp,score in scored_pps]
-                score = [score for pp,score in norm_pps if pp == phrase_pair][0]
-            eval_metric += (1-score)**2
-    mean_eval = eval_metric / len(heldout_idxs)    
+            count += 1
+    mean_eval = eval_metric / count
     print "Time taken to evaluate held-out: %.1f sec"%(time.clock()-start)
-    if method == "cca":
-        print "Mean Reciprocal Rank: %.3f"%mean_eval
-    else:
-        print "Mean Squared Error: %.3f"%mean_eval
+    print "Out of %d examples, %d are not singletons"%(len(heldout_idxs), count)
+    print "Mean Reciprocal Rank: %.3f"%mean_eval
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:g:h:k:l:m:o:ps:S:r:v:')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:g:h:l:m:o:pPs:S:r:v:w:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
@@ -103,9 +93,9 @@ def main():
     filter_sw = ""
     vector_loc = ""
     context_loc = ""
-    kappa = -1
     oov = 1 #cut-off for OOV handling of features
     method = "cca" #2-step cca is default
+    whitening = "full"
     concat = False
     heldout_frac = 0
     shrinkage_frac = 0
@@ -134,8 +124,6 @@ def main():
             filter_features = opt[1]
         elif opt[0] == '-s': #stop word filtering
             filter_sw = opt[1]
-        elif opt[0] == '-k': #re-scaling
-            kappa = float(opt[1])
         elif opt[0] == '-o': #OOV handling - set to singletons by default
             oov = int(opt[1])
         elif opt[0] == '-m': #method - one of 'cca', 'glm', or 'mlp'
@@ -150,6 +138,8 @@ def main():
             vector_loc = opt[1]
         elif opt[0] == '-C': #context file 
             context_loc = opt[1]
+        elif opt[0] == '-w': 
+            whitening = opt[1]
     if phrase_pairs_loc == "" or output_loc == "":
         sys.stderr.write("Error! Need to define a location for per-sentence phrase pairs and an output directory to write parameters\n")
         sys.exit() 
@@ -164,6 +154,9 @@ def main():
         sys.exit()
     if shrinkage_frac > 0 and method != "glm":
         sys.stderr.write("Error! James-Stein shrinkage only works on GLM (general linear model)\n")
+        sys.exit()
+    if not (whitening == "identity" or whitening == "full" or whitening == "diag" or whitening == "ppmi"):
+        sys.stderr.write("Error! Whitening values can only be 'identity', 'full' (inverse square root), 'diag' (approximation to inverse square root), or 'ppmi' (PPMI scaling)\n")
         sys.exit()
 
     #set up data structures and extract context features and tokens from corpus
@@ -205,21 +198,18 @@ def main():
         heldout_idxs = sorted(random.sample(xrange(num_tokens), sample_size))
         train_idxs = list(set(xrange(num_tokens)) - set(heldout_idxs))
         print "Selected %d out of %d samples for held-out set"%(sample_size, num_tokens)
-    if kappa > 0: #rescaling requested; do we also rescale tokens? 
-        left_con.rescale_features(kappa)
-        right_con.rescale_features(kappa)
-        print "Rescaled features with kappa=%.3f"%kappa
     context = None
     if context_loc != "" and os.path.isfile(context_loc): #read in pre-computed context
         context_fh = open(context_loc, 'rb')
         context = cPickle.load(context_fh)
         context_fh.close()
     else:
-        context = Context(left_con, right_con, gamma1, rank1, concat, con_length, train_idxs)
+        context = Context(left_con, right_con, gamma1, rank1, concat, con_length, train_idxs, whitening)
         if context_loc != "":
             context_fh = open(context_loc, 'wb')
             cPickle.dump(context, context_fh)
             context_fh.close()
+
     lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con.get_token_matrix(train_idxs), right_con.get_token_matrix(train_idxs))
     model = None
     if method == "cca":

@@ -5,32 +5,70 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.io as io
 from scipy.special import expit
-from mlp.mlp import MLPClassifier
+from mlp import MLPClassifier
 
-'''
-for CCA computations: X - left matrix, Y - right matrix, param - rank
-for regression: X - desin matrix, Y - response matrix, param - regularization strength
-'''
-def matlab_interface(X, Y, option, reg_strength, rank = 50):
+def compute_regression(X, Y, reg_strength):
     pwd = os.getcwd()
     out_loc = pwd + "/matlab_temp"
     io.savemat(out_loc, {'X': X, 'Y': Y})
     path = os.path.abspath(os.path.dirname(sys.argv[0])) #matlab scripts in the same place as this script
-    os.chdir(path)
-    if option == "CCA":
-        os.system('matlab -nodesktop -nosplash -nojvm -r "cca_wrapper ' + out_loc + " %s %s"%(rank, reg_strength) + '"')
-    else: #option == "regression"
-        os.system('matlab -nodesktop -nosplash -nojvm -r "regression_wrapper ' + out_loc + " %s"%reg_strength + '"')
+    os.chdir(path+"/matlab")
+    os.system('matlab -nodesktop -nosplash -nojvm -r "regression_wrapper ' + out_loc + " %s"%reg_strength + '"')
     os.chdir(pwd)
     mat_return = io.loadmat(out_loc)
-    if option == "CCA":
-        return mat_return['A'].newbyteorder('='), mat_return['B'].newbyteorder('='), mat_return['r'].newbyteorder('=')
+    return mat_return['beta']
+
+def compute_cca(X, Y, reg_strength, rank, approx="full"):
+    p1 = X.shape[1]
+    p2 = Y.shape[1]
+    cross_cov = np.dot(X.transpose(), Y) #X^T Y - csc matrix if X and Y are CSR
+    pwd = os.getcwd()
+    out_loc = pwd + "/matlab_temp"
+    whiten_left = None
+    whiten_right = None
+    if approx == "diag": #compute diagonal approx to inverse square root matrix
+        X_cp = X
+        Y_cp = Y
+        X_cp.data **= 2
+        Y_cp.data **= 2
+        feature_counts_left = X_cp.sum(axis=0) + reg_strength
+        feature_counts_right = Y_cp.sum(axis=0) + reg_strength
+        scale_vec_left = np.reciprocal(np.sqrt(feature_counts_left))
+        scale_vec_right = np.reciprocal(np.sqrt(feature_counts_right))
+        whiten_left = sp.spdiags(scale_vec_left.flatten(), [0], p1, p1)
+        whiten_right = sp.spdiags(scale_vec_right.flatten(), [0], p2, p2)
+        cross_cov = whiten_left*cross_cov*whiten_right #scipy sparse matrices * operator is matrix mult
+    elif approx == "ppmi": 
+        n = X.shape[0]
+        inv_feat_counts_left = np.reciprocal(X.sum(axis=0)+1) #add one if not in training but only in held-out
+        inv_feat_counts_left_scaled = np.multiply(inv_feat_counts_left, n)
+        left_mult = sp.spdiags(inv_feat_counts_left_scaled, [0], p1, p1)
+        inv_feat_counts_right = np.reciprocal(Y.sum(axis=0)+1)
+        right_mult = sp.spdiags(inv_feat_counts_right.flatten(), [0], p2, p2)
+        cross_cov = left_mult*cross_cov*right_mult #p(x,y) / (p(x) * p(y))
+        cross_cov.data = np.log(cross_cov.data) - np.log(reg_strength) #element-wise log and shift
+        cross_cov.data *= cross_cov.data > 0 #filtering out non-zeros
+        cross_cov.eliminate_zeros()
+    if approx == "full":
+        io.savemat(out_loc, {'X': X, 'Y': Y})
+        path = os.path.abspath(os.path.dirname(sys.argv[0])) 
+        os.chdir(path+"/matlab") #matlab scripts in 'matlab' sub-directory
+        os.system('matlab -nodesktop -nosplash -nojvm -r "cca_wrapper ' + out_loc + " %s %s"%(rank, reg_strength) + '"')        
     else:
-        return mat_return['beta'].newbyteorder('=')
+        io.savemat(out_loc, {'avgOP': cross_cov})
+        path = os.path.abspath(os.path.dirname(sys.argv[0])) #matlab scripts in the same place as this script
+        os.chdir(path+"/matlab")
+        os.system('matlab -nodesktop -nosplash -nojvm -r "matlab_svd ' + out_loc + " %s"%rank + '"')
+    os.chdir(pwd)
+    mat_return = io.loadmat(out_loc)
+    if approx == "diag": #if diag approx, multiply result by scaling
+        return whiten_left.dot(mat_return['U']), whiten_right.dot(mat_return['V']), mat_return['S']
+    else: #for full CCA, already scaled in cca_direct.m
+        return mat_return['U'], mat_return['V'], mat_return['S']         
 
 class Context:
-    def __init__(self, left_context, right_context, gamma, rank, concat=False, con_length = 2, train_idxs=None):
-        phi_l, phi_r, lr_correlations = matlab_interface(left_context.get_token_matrix(train_idxs), right_context.get_token_matrix(train_idxs), "CCA", gamma, rank)
+    def __init__(self, left_context, right_context, gamma, rank, concat=False, con_length = 2, train_idxs=None, approx="full"):
+        phi_l, phi_r, lr_correlations = compute_cca(left_context.get_token_matrix(train_idxs), right_context.get_token_matrix(train_idxs), gamma, rank, approx)
         self.left_proj_mat = phi_l
         self.right_proj_mat = phi_r
         self.left_map = left_context.get_type_map()
@@ -166,7 +204,7 @@ class CCA(BaseModel):
 
     def train(self, left_low_rank, right_low_rank, tokens, gamma, rank, train_idxs=None):
         training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
-        phi_s, phi_w, cw_correlations = matlab_interface(training_data, tokens.get_token_matrix(train_idxs), "CCA", gamma, rank)
+        phi_s, phi_w, cw_correlations = compute_cca(training_data, tokens.get_token_matrix(train_idxs), gamma, rank, "full")
         self.context_parameters = phi_s
         self.parameters = phi_w
         print "Two-step CCA complete. Correlations between combined context and tokens (with rank %d): "%rank
@@ -194,7 +232,7 @@ class GLM(BaseModel):
     def train(self, left_low_rank, right_low_rank, tokens, gamma, train_idxs=None):
         offset = np.ones((left_low_rank.shape[0], 1))        
         training_data = np.concatenate((left_low_rank, right_low_rank, offset), axis=1) #if each low-rank context is p-dim, then this is a 2p+1 dim vec
-        self.parameters = matlab_interface(training_data, tokens.get_token_matrix(train_idxs), "regression", gamma)
+        self.parameters = compute_regression(training_data, tokens.get_token_matrix(train_idxs), gamma)
         print "Fitted general linear model: %d responses %d predictors, %d samples"%(self.parameters.shape[1], self.parameters.shape[0], left_low_rank.shape[0])
 
     def score(self, context_rep, phrase): 
