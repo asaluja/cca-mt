@@ -32,18 +32,19 @@ from model import *
 extracts phrase pairs (tokens) and context, since the phrase pair list
 is decorated with span information for the phrases so we can do this easily. 
 '''
-def extract_tokens(filehandle, sentence, tokens, left_con, right_con, extractor, use_wordvecs):
+def extract_tokens(filehandle, sentence, tokens, left_con, right_con, extractor, all_phrase_pairs, use_wordvecs):
     sentence_items = sentence.split()
     for rule in filehandle:
         elements = rule.strip().split(' ||| ')
         src_phrase = elements[0]
         tgt_phrase = elements[1]
         phrase_pair = ' ||| '.join([src_phrase, tgt_phrase])
+        all_phrase_pairs.add(phrase_pair)
         span = rule.strip().split(' ||| ')[2]
         left_idx = int(span.split('-')[0])
         right_idx = int(span.split('-')[1])
         left_con_words, right_con_words = extractor.extract_context(sentence_items, left_idx, right_idx)
-        if use_wordvecs: #left_con_words and right_con_words are two real-valued arrays
+        if use_wordvecs: #left_con_words and right_con_words are two real-valued vectors
             tokens.add_token([phrase_pair])
             left_con.add_token_vec(left_con_words)
             right_con.add_token_vec(right_con_words)
@@ -60,27 +61,40 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model, me
     assert left_low_rank.shape[0] == right_low_rank.shape[0] == len(heldout_idxs)
     start = time.clock()    
     heldout_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
-    eval_metric = 0
-    count = 0
+    mrr = 0
+    mrr_hard_examples = 0
+    nonsingleton_count = 0
+    multi_translation_count = 0
+    hard_examples_count = 0
+    avg_length = 0
     for idx, test_idx in enumerate(heldout_idxs):
         rows, cols = tokens.get_token_matrix()[test_idx,:].nonzero()
         assert len(cols) == 1 #since this is the tokens data, there should only be one non-zero per row
-        phrase_id = cols[0] #gives idx of right answer
-        phrase_pair = tokens.get_token_phrase(phrase_id)
-        src_phrase = phrase_pair.split(' ||| ')[0]
-        scored_pps = model.score(heldout_data[idx,:], src_phrase)
-        if len(scored_pps) > 1: #only score non-singletons
-            sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #sort by score to get rank
-            scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0]
-            eval_metric += 1./scored_rank
-            count += 1
-    mean_eval = eval_metric / count
+        phrase_id = cols[0] #gives idx of right answer - could be OOV if singleton
+        phrase_pair = tokens.get_token_phrase(phrase_id) 
+        src_phrase = phrase_pair.split(' ||| ')[0] #src_phrase = <unk> if singleton phrase pair which we don't predict
+        if src_phrase != "<unk>": 
+            nonsingleton_count += 1
+            scored_pps = model.score(heldout_data[idx,:], src_phrase) #will score phrase, some phrase pairs may have score=None if singleton
+            if len(scored_pps) > 1: #only record scores if there is more than one translation for source phrase
+                avg_length += len(scored_pps)
+                sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #sort by score to get rank
+                scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0] #because we filtered for singleton PPs, guaranteed that scored_rank is not None
+                mrr += 1./scored_rank
+                multi_translation_count += 1
+                if scored_rank > 1: #separate tracking if correct translation was not ranked 1
+                    mrr_hard_examples += 1./scored_rank
+                    hard_examples_count += 1
+    mrr /= multi_translation_count
+    mrr_hard_examples /= hard_examples_count
+    avg_length = float(avg_length) / multi_translation_count
     print "Time taken to evaluate held-out: %.1f sec"%(time.clock()-start)
-    print "Out of %d examples, %d are not singletons"%(len(heldout_idxs), count)
-    print "Mean Reciprocal Rank: %.3f"%mean_eval
+    print "Out of %d examples (source phrases), %d are not singleton, %d have > 1 translation (restricting scoring to these phrases)"%(len(heldout_idxs), nonsingleton_count, multi_translation_count)
+    print "Mean Reciprocal Rank: %.3f; Average number of translations per phrase: %.2f"%(mrr, avg_length)
+    print "Mean Reciprocal Rank for phrase pairs not ranked 1: %.3f"%mrr_hard_examples
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:g:h:l:m:o:pPs:S:r:v:w:')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:g:h:l:m:Mo:pPs:S:r:v:w:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
@@ -94,8 +108,10 @@ def main():
     vector_loc = ""
     context_loc = ""
     oov = 1 #cut-off for OOV handling of features
+    prune_singletons = False
     method = "cca" #2-step cca is default
     whitening = "full"
+    mean_center = False
     concat = False
     heldout_frac = 0
     shrinkage_frac = 0
@@ -126,6 +142,8 @@ def main():
             filter_sw = opt[1]
         elif opt[0] == '-o': #OOV handling - set to singletons by default
             oov = int(opt[1])
+        elif opt[0] == '-P':
+            prune_singletons = True
         elif opt[0] == '-m': #method - one of 'cca', 'glm', or 'mlp'
             method = opt[1]
         elif opt[0] == '-c': #concatenation models (instead of additive)
@@ -140,6 +158,8 @@ def main():
             context_loc = opt[1]
         elif opt[0] == '-w': 
             whitening = opt[1]
+        elif opt[0] == '-M': #mean-center
+            mean_center = True
     if phrase_pairs_loc == "" or output_loc == "":
         sys.stderr.write("Error! Need to define a location for per-sentence phrase pairs and an output directory to write parameters\n")
         sys.exit() 
@@ -160,32 +180,33 @@ def main():
         sys.exit()
 
     #set up data structures and extract context features and tokens from corpus
-    start = time.clock()    
-    tokens = SparseContainer()
+    start = time.clock()
+    tokens = SparseContainer(oov) if prune_singletons else SparseContainer()
     use_wordvecs = vector_loc != ""
     left_con = SparseContext(oov)
     right_con = SparseContext(oov)
     extractor = ContextExtractor(con_length, pos_depend, filter_sw, filter_features, vector_loc)
-    print "Sentence Count:\t",
+    all_phrase_pairs = set()
+    print "Sentence Count: ",
     for count, line in enumerate(sys.stdin):
         source = line.strip().split(' ||| ')[0]
         phrase_pair_fh = gzip.open(phrase_pairs_loc + "/grammar.%d.gz"%count)
-        extract_tokens(phrase_pair_fh, source, tokens, left_con, right_con, extractor, use_wordvecs)
-        if count % 10000 == 0:
+        extract_tokens(phrase_pair_fh, source, tokens, left_con, right_con, extractor, all_phrase_pairs, use_wordvecs)
+        if count % 10000 == 0: #to track rate of feature extraction
             print "%d\t"%count,
             sys.stdout.flush()
         phrase_pair_fh.close()
     print
     print "Extracted features from parallel corpus. Time: %.1f sec"%(time.clock()-start)
 
-    #convert context features to sparse matrix, rescale and compute parameters
-    tokens.create_sparse_matrix()    
-    if not use_wordvecs:
-        left_con.create_sparse_matrix(pos_depend, con_length) #take pos depend and con_length as args to make pos-dep OOV types
-        right_con.create_sparse_matrix(pos_depend, con_length) #can probably simplify and remove dependence on con_length (inferred from data)
-    else:
+    #convert context features to matrices and compute/load context representations
+    tokens.create_sparse_matrix() #lose all singleton information here 
+    if use_wordvecs:
         left_con.create_dense_matrix()
         right_con.create_dense_matrix()
+    else:
+        left_con.create_sparse_matrix(pos_depend, con_length) #take pos depend and con_length as args to make pos-dep OOV types
+        right_con.create_sparse_matrix(pos_depend, con_length) #can probably simplify and remove dependence on con_length (inferred from data)
     print "Number of tokens: %d; Number of types: %d"%(tokens.get_token_matrix().shape[0], tokens.get_token_matrix().shape[1])
     print "Left context dim: %d; Right context dim: %d"%(left_con.get_token_matrix().shape[1], right_con.get_token_matrix().shape[1])
     heldout_idxs = None
@@ -204,34 +225,35 @@ def main():
         context = cPickle.load(context_fh)
         context_fh.close()
     else:
-        context = Context(left_con, right_con, gamma1, rank1, concat, con_length, train_idxs, whitening)
+        context = Context(left_con, right_con, gamma1, rank1, concat, con_length, train_idxs, whitening, mean_center)
         if context_loc != "":
             context_fh = open(context_loc, 'wb')
             cPickle.dump(context, context_fh)
             context_fh.close()
-
     lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con.get_token_matrix(train_idxs), right_con.get_token_matrix(train_idxs))
+
+    #compute parameters for low-rank phrase disambiguation model
     model = None
     if method == "cca":
-        model = CCA(context, tokens.get_type_map())
-        model.train(lr_mat_l, lr_mat_r, tokens, gamma2, rank2, train_idxs)
+        model = CCA(context, tokens.get_type_map(), all_phrase_pairs)
+        model.train(lr_mat_l, lr_mat_r, tokens, gamma2, rank2, train_idxs, whitening, mean_center)
     elif method == "glm":
-        model = GLM(context, tokens.get_type_map())
+        model = GLM(context, tokens.get_type_map(), all_phrase_pairs)
         model.train(lr_mat_l, lr_mat_r, tokens, gamma2, train_idxs)
     elif method == "mlp":
-        model = MLP(context, tokens.get_type_map(), gamma2, rank2)
+        model = MLP(context, tokens.get_type_map(), all_phrase_pairs, gamma2, rank2)
         model.train(lr_mat_l, lr_mat_r, tokens, train_idxs)
     else:
         sys.stderr.write("Model argument not recognized; please input one of 'cca', 'glm', or 'mlp'\n")
         sys.exit()
-    if heldout_frac > 0 or shrinkage_frac > 0:
+    if heldout_frac > 0 or shrinkage_frac > 0: #evaluate held-out if requested
         lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con.get_token_matrix(heldout_idxs), right_con.get_token_matrix(heldout_idxs))    
-        if heldout_frac > 0:
-            score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model, method)
-        else: #shrinkage defined
+        score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model, method)
+        if shrinkage_frac > 0:
             model.shrink_estimates(lr_mat_l, lr_mat_r, tokens, heldout_idxs)
-            score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model, method)
-        
+            score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model, method) #score again to see improvement
+    
+    #write out parameters to disk
     start = time.clock()
     out_fh = open(output_loc, 'wb')
     cPickle.dump(model, out_fh)

@@ -123,14 +123,24 @@ def compute_scores(hg, words, out_filename):
                 left_con_words, right_con_words = extractor.extract_context(words, left_idx, right_idx-1) #same as before, either real-valued arrays or lists of words
                 left_con_lr, right_con_lr = model.get_context_rep_vec(left_con_words, right_con_words) if extractor.is_repvec() else model.get_context_rep(left_con_words, right_con_words)
                 if left_con_lr is not None and right_con_lr is not None:
-                    concat_con_lr = np.concatenate((left_con_lr, right_con_lr), axis=1)
-                    scored_pps = model.score(concat_con_lr, edge.rule)
+                    concat_con_lr = np.concatenate((left_con_lr, right_con_lr))
+                    scored_pps = model.score(concat_con_lr, edge.rule) #returns list of phrase pairs along with their context-specific score; score is None if phrase pair exists but we can't score it, which only happens if it's a singleton and singleton pruning is defined
                     if normalize:
-                        normalizer = sum([score for pp,score in scored_pps])
-                        scored_pps = [(pp, score/normalizer) for pp,score in scored_pps] if normalizer != 0 else [(pp, 0) for pp,score in scored_pps]
-                    sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True)
+                        normalizer = sum([score for pp,score in scored_pps if score is not None])
+                        normalized_pps = []
+                        for pp, score in scored_pps:
+                            if score is None:
+                                normalized_pps.append((pp, score))
+                            else:
+                                pp_norm = (pp, score/normalizer) if normalizer != 0 else (pp, 0)
+                                normalized_pps.append(pp_norm)
+                        scored_pps = normalized_pps
+                    sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #should gracefully handle None values
                     for pp, score in sorted_pps:
-                        out_fh.write("%s ||| %s ||| cca_score=%.3f\n"%(LHS, pp, score))
+                        if score is None:
+                            out_fh.write("%s ||| %s ||| cca_off=1\n"%(LHS, pp))
+                        else:
+                            out_fh.write("%s ||| %s ||| cca_on=1 cca_score=%.3f\n"%(LHS, pp, score))
                 else: #this occurs if all context words are stop words
                     left_null = left_con_lr is None
                     null_context_side = "left" if left_null else "right"

@@ -67,7 +67,8 @@ class SparseContainer(object):
         if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
             print "Number of tokens <= oov cut-off %d: %d"%(self._cutoff, len(self._oov_map))
             oov_feat_id = len(self.type_id_map) #corresponds to id of new OOV feat
-            self.type_id_map["<unk>"] = oov_feat_id #unk is position-independent                
+            self.type_id_map["<unk> ||| <unk>"] = oov_feat_id #unk is position-independent                
+            self.id_type_map[oov_feat_id] = "<unk> ||| <unk>"
             for low_freq_token in self._oov_map: #loop through and add indicator to <unk> (pos-dep if flagged)
                 count, row_idxs = self._oov_map[low_freq_token]
                 for row_idx in row_idxs:
@@ -94,6 +95,7 @@ class SparseContainer(object):
             return self.id_type_map[token_id]
         else:
             sys.stderr.write("ERROR! Provided ID not in map!\n")
+            sys.exit()
 
 
 class SparseContext(SparseContainer):
