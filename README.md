@@ -6,7 +6,7 @@ cca-mt
 
 - NumPy (at least v1.6, preferably v1.9) and SciPy (at least v0.13, preferably v0.15)
 - MATLAB for fast SVD/CCA computation
-- [cdec](http://www.cdec-decoder.org/), for MT tuning and decoding. 
+- [cdec](http://www.cdec-decoder.org/), for MT tuning and decoding
 
 ## End-to-End Pipeline Instructions
 

@@ -1,0 +1,3 @@
+[submodule "rand-cca"]
+	path = rand-cca
+	url = https://github.com/pmineiro/cca.git
