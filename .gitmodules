@@ -1,3 +1,6 @@
 [submodule "rand-cca"]
 	path = matlab/rand-cca
 	url = https://github.com/pmineiro/cca.git
+[submodule "matlab/rand-cca"]
+	path = matlab/rand-cca
+	url = https://github.com/pmineiro/cca.git
