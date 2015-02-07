@@ -25,9 +25,9 @@ def compute_cca(X, Y, reg_strength, rank, approx="full", mean_center=False):
     X = sp.csr_matrix(X)
     cross_cov = X.transpose().dot(Y)
     if mean_center:
-        feature_counts_left = X.sum(axis=0)
-        feature_counts_right = Y.sum(axis=0)
-        mean_center_mat = feature_counts_left.transpose().dot(feature_counts_right) #dense matrix
+        feature_counts_left = np.multiply(X.sum(axis=0), 1./n)
+        feature_counts_right = np.multiply(Y.sum(axis=0), 1./n)
+        mean_center_mat = feature_counts_left.transpose().dot(feature_counts_right)
         mean_center_mat = np.multiply(mean_center_mat, n)
         cross_cov = cross_cov - sp.csc_matrix(mean_center_mat) #dense matrix, but in sparse data structure        
     pwd = os.getcwd()
