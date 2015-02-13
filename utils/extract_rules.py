@@ -19,6 +19,7 @@ Options:
 -m X: adjust the maximum length of a phrase extracted (default is 6)
 -l: extract lexical translations instead of phrase pairs. STDIN is ignored in this setting. 
 January 20, 2015: updated and added counts dictionary writing here (for downstream feature computation).  
+To Do: instead of defined s-exprsesion parser, use nltk?
 '''
 
 import sys, commands, string, collections, gzip, re, getopt, cPickle
@@ -173,7 +174,7 @@ def main():
     alignments = open(args[1], 'r').read().splitlines()
     output_dir = args[2]
     counts_out = args[3]
-    max_length = 6
+    max_length = 5
     lex = False
     for opt in opts:
         if opt[0] == '-m':

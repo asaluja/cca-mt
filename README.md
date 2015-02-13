@@ -29,7 +29,7 @@ Steps:
 
    Options:
    - `-l`: lexical model; outputs translations from word alignments.  `STDIN` is ignored if enabled. 
-   - `-m X`: maximum length of phrase pair.  Default is 6. 
+   - `-m X`: maximum length of phrase pair.  Default is 5. 
 
 2. Train the model:
 

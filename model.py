@@ -4,6 +4,7 @@ import sys, commands, string, os, time
 import numpy as np
 import scipy.sparse as sp
 import scipy.io as io
+import wabbit_wappa as ww
 from scipy.special import expit
 from mlp import MLPClassifier
 
@@ -18,7 +19,7 @@ def compute_regression(X, Y, reg_strength):
     mat_return = io.loadmat(out_loc)
     return mat_return['beta']
 
-def compute_cca(X, Y, reg_strength, rank, approx="full", mean_center=False):
+def compute_cca(X, Y, reg_strength, rank, approx, mean_center):
     p1 = X.shape[1]
     p2 = Y.shape[1]
     n = X.shape[0]
@@ -74,12 +75,12 @@ def compute_cca(X, Y, reg_strength, rank, approx="full", mean_center=False):
         return mat_return['U'], mat_return['V'], mat_return['S']         
 
 class Context:
-    def __init__(self, left_context, right_context, gamma, rank, concat=False, con_length = 2, train_idxs=None, approx="full", mean_center = False):
-        phi_l, phi_r, lr_correlations = compute_cca(left_context.get_token_matrix(train_idxs), right_context.get_token_matrix(train_idxs), gamma, rank, approx, mean_center)
+    def __init__(self, left_context, left_type, right_context, right_type, gamma, rank, approx, mean_center, concat, con_length):
+        phi_l, phi_r, lr_correlations = compute_cca(left_context, right_context, gamma, rank, approx, mean_center)
         self.left_proj_mat = phi_l
         self.right_proj_mat = phi_r
-        self.left_map = left_context.get_type_map()
-        self.right_map = right_context.get_type_map()
+        self.left_map = left_type
+        self.right_map = right_type
         self.concat = concat
         self.con_length = con_length
         print "Correlations between left and right context (with rank %d): "%rank
@@ -201,9 +202,9 @@ class CCA(BaseModel):
         super(CCA, self).__init__(type_map, all_pp, context)
         self.context_parameters = None
 
-    def train(self, left_low_rank, right_low_rank, tokens, gamma, rank, train_idxs=None, approx="full", mean_center=False):
+    def train(self, left_low_rank, right_low_rank, training_labels, gamma, rank, approx, mean_center):
         training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
-        phi_s, phi_w, cw_correlations = compute_cca(training_data, tokens.get_token_matrix(train_idxs), gamma, rank, approx, mean_center)
+        phi_s, phi_w, cw_correlations = compute_cca(training_data, training_labels, gamma, rank, approx, mean_center)
         self.context_parameters = phi_s
         self.parameters = phi_w
         print "Two-step CCA complete. Correlations between combined context and tokens (with rank %d): "%rank
@@ -217,21 +218,72 @@ class CCA(BaseModel):
         for translation in translations:
             phrase_pair = ' ||| '.join([phrase, translation])
             representation = self.get_representation(phrase_pair) #if representation is None, score is None
-            score = None if representation is None else representation.dot(bidi_con_rep.transpose()) / (np.linalg.norm(representation)*bidi_con_rep_norm)
-            #if score < 0:
-            #    score = 0
+            rep_norm = np.linalg.norm(representation) if representation is not None else 0
+            score = None if (representation is None or rep_norm == 0) else representation.dot(bidi_con_rep.transpose()) / (rep_norm*bidi_con_rep_norm)
             scored_pairs.append((phrase_pair, score))
         return scored_pairs
+
+class MaxEnt(BaseModel):
+    def __init__(self, context, type_map, all_pp, subset_norm):
+        super(MaxEnt, self).__init__(type_map, all_pp, context)
+        self.vw = ww.VW(loss_function='logistic', oaa=len(type_map))
+        self.subset_norm = subset_norm
+        print self.vw.command
+
+    def __label_features(self, features):
+        left_row, right_row = np.split(features,2)
+        left_labeled = [("leftdim%d"%(idx+1), val)  for idx,val in enumerate(left_row)]
+        right_labeled = [("rightdim%d"%(idx+1), val)  for idx,val in enumerate(right_row)]
+        return left_labeled + right_labeled
+    
+    def __decorate_labels(self, phrase_id, id_type_map):
+        other_cost = 100
+        phrase_pair = id_type_map[phrase_id]
+        src_phrase = phrase_pair.split(' ||| ')[0]
+        col_idxs, phrase_pairs = self.get_candidate_indices(src_phrase)
+        col_idxs = [idx for idx in col_idxs if idx != -1] #remove candidates that we can't score
+        labels = []
+        idx_in_col_idxs = False
+        for idx in col_idxs:
+            if idx == phrase_id:
+                labels.append("%d:0"%idx)
+                idx_in_col_idxs = True
+            else:
+                labels.append("%d:%d"%(idx,other_cost))        
+        assert idx_in_col_idxs == True
+        return ' '.join(labels)
+
+    def train(self, left_low_rank, right_low_rank, training_labels, gamma, id_type_map):
+        N = training_labels.shape[0]
+        training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
+        start = time.clock()
+        max_label = 0
+        for row_idx in xrange(N):
+            label_row, label_col = training_labels[row_idx,:].nonzero()
+            if len(label_col) == 1:
+                feature_str_list = self.__label_features(training_data[row_idx,:])
+                feature_str = ' '.join(["%s:%.5f"%(feat_label, feat_val) for feat_label,feat_val in feature_str_list])
+                label = self.__decorate_labels(label_col[0], id_type_map) if self.subset_norm else str(label_col[0] + 1) #attach costs or not
+                sys.stderr.write("%s | %s\n"%(label,feature_str))
+                if label_col[0] > max_label:
+                    max_label = label_col[0] + 1
+        print "MaxEnt Classifier (multinomial logistic regression) complete. Time: %.1f sec"%(time.clock()-start)
+        sys.exit()
+        
+    def score(self, context_rep, phrase):
+        feature_str_list = self.__label_features(context_rep)
+        prediction = self.vw.get_prediction(feature_str_list).prediction
+        print response
 
 class GLM(BaseModel):
     def __init__(self, context, type_map, all_pp):
         super(GLM, self).__init__(type_map, all_pp, context)
         self.alphas = None
 
-    def train(self, left_low_rank, right_low_rank, tokens, gamma, train_idxs=None):
+    def train(self, left_low_rank, right_low_rank, training_labels, gamma):
         offset = np.ones((left_low_rank.shape[0], 1))        
         training_data = np.concatenate((left_low_rank, right_low_rank, offset), axis=1) #if each low-rank context is p-dim, then this is a 2p+1 dim vec
-        self.parameters = compute_regression(training_data, tokens.get_token_matrix(train_idxs), gamma)
+        self.parameters = compute_regression(training_data, training_labels, gamma)
         print "Fitted general linear model: %d responses %d predictors, %d samples"%(self.parameters.shape[1], self.parameters.shape[0], left_low_rank.shape[0])
 
     def score(self, context_rep, phrase): 
@@ -289,7 +341,7 @@ class GLM(BaseModel):
             alpha_j = (1./np.dot(X, X))*np.dot(X,Y_all) #alpha computation via normal equations (OLS)
             alphas.append(alpha_j)
         self.alphas = np.array(alphas)
-        print "Shrinkage complete. Time taken: %.3f"%(time.clock()-start)
+        print "Shrinkage complete. Time: %.1f sec"%(time.clock()-start)
         print self.alphas
 
 class MLP(BaseModel):
@@ -297,11 +349,11 @@ class MLP(BaseModel):
         super(MLP, self).__init__(type_map, all_pp, context)
         self.mlp = MLPClassifier(n_hidden=rank, verbose=1, lr=gamma) #set batch size
     
-    def train(self, left_low_rank, right_low_rank, tokens, train_idxs=None):
+    def train(self, left_low_rank, right_low_rank, training_labels):
         training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
         start = time.clock()
-        self.mlp.fit(training_data, tokens.get_token_matrix(train_idxs))
-        print "MLP learning complete; input layer size: %d; hidden layer size: %d; output layer size: %d; time taken: %.1f sec"%(training_data.shape[1], self.mlp.n_hidden, tokens.get_token_matrix().shape[1], time.clock()-start)
+        self.mlp.fit(training_data, training_labels)
+        print "MLP learning complete; input layer size: %d; hidden layer size: %d; output layer size: %d; time: %.1f sec"%(training_data.shape[1], self.mlp.n_hidden, tokens.get_token_matrix().shape[1], time.clock()-start)
         
     def score(self, context_rep, phrase):
         predict_vec = self.mlp.predict(context_rep)        

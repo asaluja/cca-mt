@@ -22,7 +22,7 @@ as the means to construct them), OOV information, and a dictionary that
 maps between type strings and IDs
 '''
 class SparseContainer(object):
-    def __init__(self, oov_cutoff = 0):
+    def __init__(self, oov_cutoff, estimate_oov_param):
         self.type_id_map = {} #read/write DS
         self.id_type_map = {} #held-out eval
         self._rows = []
@@ -32,50 +32,76 @@ class SparseContainer(object):
         self._oov_map = {}
         self._counter = 0
         self.token_matrix = None
+        oov_id = 0 if estimate_oov_param else -1 #OOV assigned ID 0, or -1 if OOV not being used
+        self.type_id_map["<unk> ||| <unk>"] = oov_id 
+        self.id_type_map[oov_id] = "<unk> ||| <unk>"
+        self.estimate_oov = estimate_oov_param
 
-    '''
-    Note: function below takes a list as an argument and can be used by
-    SparseContainer as well as the SparseContext child class
-    '''
-    def add_token(self, features):
-        for feature in features:
-            if feature in self.type_id_map: #features make it here only after they exceed the oov cutoff, so we increment as normal
-                self._rows.append(self._counter)
-                self._cols.append(self.type_id_map[feature])
-                self._vals.append(1.)
-            else: #either feature is in oov map or this is the first time we've seen this feature
-                count, row_idxs = self._oov_map[feature] if feature in self._oov_map else (0, []) #pull up count and row_idxs, else assign init
-                count += 1
-                row_idxs.append(self._counter)
-                if count > self._cutoff: #if cut off exceeded, add to seen features
-                    feature_id = len(self.type_id_map) #obtain feature ID
-                    self.type_id_map[feature] = feature_id
-                    self.id_type_map[feature_id] = feature
+    def add_token(self, token, excluded_tokens):
+        if token in self.type_id_map: #features make it here only after they exceed the oov cutoff, so we increment as normal
+            self._rows.append(self._counter)
+            self._cols.append(self.type_id_map[token])
+            self._vals.append(1.)
+        else: #either token is in oov map or this is the first time we've seen this token
+            count, row_idxs = self._oov_map[token] if token in self._oov_map else (0, []) #pull up count and row_idxs, else assign init
+            count += 1 #add current token
+            row_idxs.append(self._counter)
+            if count > self._cutoff: #if cut off exceeded, add to seen tokens
+                token_id = -1
+                if token in excluded_tokens: #if phrase pair is in excluded pairs
+                    token_id = self.type_id_map["<unk> ||| <unk>"] #either OOV if estimating OOV param or -1
+                else: #seen enough times and not in excluded pairs
+                    token_id = len(self.type_id_map) if self.estimate_oov else len(self.type_id_map)-1
+                    self.type_id_map[token] = token_id #and add to observed features
+                    self.id_type_map[token_id] = token
+                if token_id > -1: #meeans we are estimating OOV param
                     for row_idx in row_idxs:
                         self._rows.append(row_idx)
-                        self._cols.append(feature_id)
+                        self._cols.append(token_id) 
                         self._vals.append(1.)
-                    self._oov_map.pop(feature, None) #and remove from potential OOV features (returns None if not there)
-                else: #otherwise, add to OOV features
-                    self._oov_map[feature] = (count, row_idxs)
+                self._oov_map.pop(token, None) #and remove from potential OOV features (returns None if not there)
+            else: #otherwise, add to OOV map
+                self._oov_map[token] = (count, row_idxs)
         self._counter += 1
 
     '''
     creates scipy csr matrix based on collected features, and also handles OOVs
+    To do: should we filter zero_rows here and then return? 
     '''
     def create_sparse_matrix(self):
-        if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
-            print "Number of tokens <= oov cut-off %d: %d"%(self._cutoff, len(self._oov_map))
-            oov_feat_id = len(self.type_id_map) #corresponds to id of new OOV feat
-            self.type_id_map["<unk> ||| <unk>"] = oov_feat_id #unk is position-independent                
-            self.id_type_map[oov_feat_id] = "<unk> ||| <unk>"
-            for low_freq_token in self._oov_map: #loop through and add indicator to <unk> (pos-dep if flagged)
-                count, row_idxs = self._oov_map[low_freq_token]
-                for row_idx in row_idxs:
-                    self._rows.append(row_idx)
-                    self._cols.append(oov_feat_id)
-                    self._vals.append(1.)
-        self.token_matrix = sp.csr_matrix((self._vals, (self._rows, self._cols)), shape = (self._counter, len(self.type_id_map)))
+        if self.estimate_oov:
+            if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
+                print "Number of types <= oov cut-off %d: %d"%(self._cutoff, len(self._oov_map))
+                oov_feat_id = self.type_id_map["<unk> ||| <unk>"]                
+                for low_freq_token in self._oov_map: #loop through and add indicator to <unk> (pos-dep if flagged)
+                    count, row_idxs = self._oov_map[low_freq_token]
+                    for row_idx in row_idxs:
+                        self._rows.append(row_idx)
+                        self._cols.append(oov_feat_id)
+                        self._vals.append(1.)
+            self.token_matrix = sp.csr_matrix((self._vals, (self._rows, self._cols)), shape = (self._counter, len(self.type_id_map)))
+        else: #don't want to include OOV entry in token matrix
+            self.token_matrix = sp.csr_matrix((self._vals, (self._rows, self._cols)), shape = (self._counter, len(self.type_id_map)-1))
+
+    def filter_zero_rows(self):
+        assert self.token_matrix is not None
+        rows = []
+        cols = []
+        vals = []
+        counter = 0
+        zero_rows = []
+        for row_idx in xrange(self.token_matrix.shape[0]):
+            dummy, row_cols = self.token_matrix[row_idx,:].nonzero()
+            if len(row_cols) > 0: #not a zero row
+                for row_col in row_cols:
+                    rows.append(counter)
+                    cols.append(row_col)
+                    vals.append(1.)
+                counter += 1
+            else:
+                zero_rows.append(row_idx)
+        self.token_matrix = sp.csr_matrix((vals, (rows, cols)), shape = (counter, len(self.type_id_map)-1))
+        return zero_rows
 
     def get_type_map(self):
         return self.type_id_map
@@ -97,10 +123,35 @@ class SparseContainer(object):
             sys.stderr.write("ERROR! Provided ID not in map!\n")
             sys.exit()
 
-
 class SparseContext(SparseContainer):
     def __init__(self, oov_cutoff = 0):
-        super(SparseContext, self).__init__(oov_cutoff) #initializing the parent parameters
+        super(SparseContext, self).__init__(oov_cutoff, True) #initializing the parent parameters
+        oov_id = self.type_id_map.pop("<unk> ||| <unk>", None) #SparseContext will handle its own OOVs (when constructing sparse matrix)
+        assert oov_id is not None
+        self.id_type_map.pop(oov_id, None)
+
+    def add_token(self, features):
+        for feature in features:
+            if feature in self.type_id_map: #features make it here only after they exceed the oov cutoff, so we increment as normal
+                self._rows.append(self._counter)
+                self._cols.append(self.type_id_map[feature])
+                self._vals.append(1.)
+            else: #either feature is in oov map or this is the first time we've seen this feature
+                count, row_idxs = self._oov_map[feature] if feature in self._oov_map else (0, []) #pull up count and row_idxs, else assign init
+                count += 1
+                row_idxs.append(self._counter)
+                if count > self._cutoff: #if cut off exceeded, add to seen features
+                    feature_id = len(self.type_id_map)
+                    self.type_id_map[feature] = feature_id #and add to observed features
+                    self.id_type_map[feature_id] = feature
+                    for row_idx in row_idxs:
+                        self._rows.append(row_idx)
+                        self._cols.append(feature_id) 
+                        self._vals.append(1.)
+                    self._oov_map.pop(feature, None) #and remove from potential OOV features (returns None if not there)
+                else: #otherwise, add to OOV features
+                    self._oov_map[feature] = (count, row_idxs)
+        self._counter += 1
     
     '''
     ignores OOVs, etc. 
@@ -133,6 +184,26 @@ class SparseContext(SparseContainer):
                     self._cols.append(oov_feat_id)
                     self._vals.append(1.)
         self.token_matrix = sp.csr_matrix((self._vals, (self._rows, self._cols)), shape = (self._counter, len(self.type_id_map)))
+
+    def filter_zero_rows(self, zero_rows):
+        rows = []
+        cols = []
+        vals = []
+        counter = 0
+        zero_rows = set(zero_rows) #testing membership is O(1) in set
+        original_size = self.token_matrix.shape[0]
+        for row_idx in xrange(original_size):
+            if row_idx not in zero_rows:
+                dummy, row_cols = self.token_matrix[row_idx,:].nonzero()
+                assert len(row_cols) > 0
+                for row_col in row_cols:                    
+                    rows.append(counter)
+                    cols.append(row_col)
+                    vals.append(1.)
+                counter += 1
+        assert counter + len(zero_rows) == original_size
+        self.token_matrix = sp.csr_matrix((vals, (rows, cols)), shape = (counter, len(self.type_id_map)))
+                
 
 class ContextExtractor:
     '''constructor that takes into account context window size, position dependence, and any filtering required'''
