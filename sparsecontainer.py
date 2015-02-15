@@ -71,7 +71,7 @@ class SparseContainer(object):
     def create_sparse_matrix(self):
         if self.estimate_oov:
             if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
-                print "Number of types <= oov cut-off %d: %d"%(self._cutoff, len(self._oov_map))
+                print "Number of phrase pair types <= oov cut-off %d: %d"%(self._cutoff, len(self._oov_map))
                 oov_feat_id = self.type_id_map["<unk> ||| <unk>"]                
                 for low_freq_token in self._oov_map: #loop through and add indicator to <unk> (pos-dep if flagged)
                     count, row_idxs = self._oov_map[low_freq_token]
@@ -165,7 +165,7 @@ class SparseContext(SparseContainer):
 
     def create_sparse_matrix(self, pos_depend, con_length):
         if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
-            print "Number of tokens <= oov cut-off %d: %d"%(self._cutoff, len(self._oov_map))
+            print "Number of context types <= oov cut-off %d: %d"%(self._cutoff, len(self._oov_map))
             oov_feat_id = len(self.type_id_map) #corresponds to id of new OOV feat
             if pos_depend:
                 for dist in range(con_length): #add position-dependent OOVs

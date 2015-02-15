@@ -58,8 +58,8 @@ def main():
     pool = mp.Pool(processes=num_process, initializer=init, initargs=(failed_sentences,))
     for sent_num, line in enumerate(sys.stdin):
         out_filename = output_dir + "/grammar.%d.gz"%sent_num
-        #parse(line.strip().split(), out_filename, sent_num)
-        pool.apply_async(parse, (line.strip().split(), out_filename, sent_num))
+        parse(line.strip().split(), out_filename, sent_num)
+        #pool.apply_async(parse, (line.strip().split(), out_filename, sent_num))
     pool.close()
     pool.join()
     print "number of failed sentences: %d"%(len(failed_sentences))
@@ -106,41 +106,34 @@ def parse(words, out_filename, lineNum):
         print "Time taken to compute CCA scores: %.2f sec, sentence ID: %d"%(cca_time, lineNum)
     else:
         print "FAIL; length: %d words, time taken: %.2f sec, sentence ID: %d; sentence: %s"%(len(words), parseTime, lineNum, ' '.join(words))
-        failed_sentences.append(lineNum)
+        #failed_sentences.append(lineNum)
     sys.stdout.flush()
 
 def compute_scores(hg, words, out_filename):
-    out_fh = gzip.open(out_filename, 'wb')
-    for edge in hg.edges_:
+    rules_out = []
+    phrases_to_score = []
+    for edge in hg.edges_: #first, go through hypergraph process rules that can be written out; store scorable rules for scoring later
         head = hg.nodes_[edge.headNode]
         left_idx = head.i
         right_idx = head.j
         LHS = head.cat[:-1] + "_%d_%d]"%(left_idx, right_idx)
-        if len(edge.tailNodes) == 0: #pre-terminal
-            if edge.rule == "<unk>": #this is <unk> in the phrase pair sense, not <unk> in the context sense
-                out_fh.write("%s ||| <unk> ||| %s ||| PassThrough=1\n"%(LHS, words[left_idx]))
+        if len(edge.tailNodes) > 0: #ITG rules
+            src_decorated = decorate_src_rule(hg, edge.id)
+            monotone = "[1] [2] ||| Glue=1"
+            inverse = "[2] [1] ||| Glue=1 Inverse=1"
+            rules_out.append("%s ||| %s ||| %s"%(LHS, src_decorated, monotone))
+            rules_out.append("%s ||| %s ||| %s"%(LHS, src_decorated, inverse))
+        else:
+            if edge.rule == "<unk>": #phrase is not in translation inventory
+                rules_out.append("%s ||| <unk> ||| %s ||| PassThrough=1"%(LHS, words[left_idx]))
             else:
                 left_con_words, right_con_words = extractor.extract_context(words, left_idx, right_idx-1) #same as before, either real-valued arrays or lists of words
                 left_con_lr, right_con_lr = model.get_context_rep_vec(left_con_words, right_con_words) if extractor.is_repvec() else model.get_context_rep(left_con_words, right_con_words)
-                if left_con_lr is not None and right_con_lr is not None:
+                if len(edge.rule.split()) == 1: #unigram, so write pass-through to be compatible with cdec
+                    rules_out.append("%s ||| %s ||| %s ||| PassThrough=1"%(LHS, edge.rule, edge.rule))
+                if left_con_lr is not None and right_con_lr is not None: #valid context
                     concat_con_lr = np.concatenate((left_con_lr, right_con_lr))
-                    scored_pps = model.score(concat_con_lr, edge.rule) #returns list of phrase pairs along with their context-specific score; score is None if phrase pair exists but we can't score it, which only happens if it's a singleton and singleton pruning is defined
-                    if normalize:
-                        normalizer = sum([score for pp,score in scored_pps if score is not None])
-                        normalized_pps = []
-                        for pp, score in scored_pps:
-                            if score is None:
-                                normalized_pps.append((pp, score))
-                            else:
-                                pp_norm = (pp, score/normalizer) if normalizer != 0 else (pp, 0)
-                                normalized_pps.append(pp_norm)
-                        scored_pps = normalized_pps
-                    sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #should gracefully handle None values
-                    for pp, score in sorted_pps:
-                        if score is None:
-                            out_fh.write("%s ||| %s ||| cca_off=1\n"%(LHS, pp))
-                        else:
-                            out_fh.write("%s ||| %s ||| cca_on=1 cca_score=%.3f\n"%(LHS, pp, score))
+                    phrases_to_score.append((LHS, edge.rule, concat_con_lr))
                 else: #this occurs if all context words are stop words
                     left_null = left_con_lr is None
                     null_context_side = "left" if left_null else "right"
@@ -148,16 +141,40 @@ def compute_scores(hg, words, out_filename):
                     print "WARNING: Phrase: '%s'; Context on %s ('%s') was filtered; all context words are stop words.\n"%(' '.join(words[left_idx:right_idx]), null_context_side, null_context)
                     for target_phrase in applicable_rules: #is this a good thing to do by default? 
                         phrase_pair = ' ||| '.join([edge.rule, target_phrase])
-                        out_fh.write("%s ||| %s ||| cca_score=0\n"%(LHS, phrase_pair))
-                if len(edge.rule.split()) == 1: #unigram, so write pass-through to be compatible with cdec
-                    out_fh.write("%s ||| %s ||| %s ||| PassThrough=1\n"%(LHS, edge.rule, edge.rule))
-        else: #ITG rules
-            src_decorated = decorate_src_rule(hg, edge.id)
-            monotone = "[1] [2] ||| Glue=1"
-            inverse = "[2] [1] ||| Glue=1 Inverse=1"
-            out_fh.write("%s ||| %s ||| %s\n"%(LHS, src_decorated, monotone))
-            out_fh.write("%s ||| %s ||| %s\n"%(LHS, src_decorated, inverse))
-    out_fh.write("[S] ||| [X_0_%d] ||| [1] ||| 0\n"%len(words)) #top level rule
+                        rules_out.append("%s ||| %s ||| cca_score=0"%(LHS, phrase_pair))
+    scored_pps_all = []
+    if model.isvw(): #score all phrases in sentence together
+        LHS, src_phrases, context_reps = zip(*phrases_to_score)
+        context_reps = np.vstack(context_reps)
+        scored_pps_all = model.score_all(context_reps, src_phrases)
+    else:
+        for LHS, src_phrase, context_rep in phrases_to_score:
+            scored_pps = model.score(context_rep, src_phrase)
+            scored_pps_all.append(scored_pps)
+    for idx,scored_pps in enumerate(scored_pps_all): #final processing of scored phrases
+        LHS = phrases_to_score[idx][0]
+        if normalize:
+            #normalizer = sum([score for pp,score in scored_pps if score is not None])
+            normalizer = sum([math.exp(score) for pp,score in scored_pps if score is not None]) #will be zero if all is none
+            if normalizer != 0:
+                normalizer = math.log(normalizer)
+            normalized_pps = []
+            for pp, score in scored_pps:
+                if score is None:
+                    normalized_pps.append((pp, score))
+                else: #normalizer can be 0 if before log it was 1 (meaning raw score was zero)
+                    pp_norm = (pp, math.exp(score-normalizer)) #if normalizer != 0 else (pp,0)
+                    normalized_pps.append(pp_norm)
+            scored_pps = normalized_pps
+        sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #should gracefully handle None values
+        for pp, score in sorted_pps:
+            if score is None:
+                rules_out.append("%s ||| %s ||| cca_off=1"%(LHS, pp))
+            else:
+                rules_out.append("%s ||| %s ||| cca_on=1 cca_score=%.5f"%(LHS, pp, score))        
+    out_fh = gzip.open(out_filename, 'wb')
+    for rule in rules_out:
+        out_fh.write("%s\n"%rule)
     out_fh.close()
 
 def decorate_src_rule(hg, inEdgeID):

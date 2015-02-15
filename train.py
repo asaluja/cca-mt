@@ -59,41 +59,53 @@ def extract_tokens(filehandle, sentence, tokens, left_con, right_con, extractor,
                 sys.stderr.write("WARNING! Empty left and/or right context due to stop-word filtering. You may want to either a) reduce the number of stop words or disable stop word filtering altogether or b) enlarge the context window size with the '-l' flag.\n")
                 sys.stderr.write("The phrase pair %s was skipped as a result\n"%phrase_pair)
 
-def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model, method, eval_oov_param):
+def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
     assert left_low_rank.shape[0] == right_low_rank.shape[0] == len(heldout_idxs)
     start = time.clock()    
     heldout_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
     mrr = 0
     mrr_hard_examples = 0
-    nonsingleton_count = 0
     multi_translation_count = 0
     hard_examples_count = 0
     avg_length = 0
-    for idx, test_idx in enumerate(heldout_idxs):
+    phrases = []
+    ground_truth = []
+    example_idxs = []
+    for idx, test_idx in enumerate(heldout_idxs): #assemble phrases
         rows, cols = tokens.get_token_matrix()[test_idx,:].nonzero()
-        if eval_oov_param:
-            assert len(cols) == 1
-        if len(cols) == 1: #if it's not a zero row; otherwise, it's been pruned
-            phrase_id = cols[0] #gives idx of right answer - could be OOV if singleton
-            phrase_pair = tokens.get_token_phrase(phrase_id) 
-            src_phrase = phrase_pair.split(' ||| ')[0] #src_phrase = <unk> if singleton phrase pair which we don't predict, or if filtered PP
-            if src_phrase != "<unk>": 
-                nonsingleton_count += 1
-                scored_pps = model.score(heldout_data[idx,:], src_phrase) #will score phrase, some phrase pairs may have score=None if singleton
-                if len(scored_pps) > 1: #only record scores if there is more than one translation for source phrase
-                    avg_length += len(scored_pps)
-                    sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #sort by score to get rank
-                    scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0] #because we filtered for singleton PPs, guaranteed that scored_rank is not None
-                    mrr += 1./scored_rank
-                    multi_translation_count += 1
-                    if scored_rank > 1: #separate tracking if correct translation was not ranked 1
-                        mrr_hard_examples += 1./scored_rank
-                        hard_examples_count += 1
+        if len(cols) == 1: #if it is not a zero row, otherwise it has been pruned
+            phrase_pair = tokens.get_token_phrase(cols[0])            
+            src_phrase = phrase_pair.split(' ||| ')[0]
+            if src_phrase != "<unk>":
+                phrases.append(src_phrase)
+                ground_truth.append(phrase_pair)
+                example_idxs.append(idx)
+    print "Heldout: assembled phrases that can be scored"
+    scored_pps_all = [] #all src phrases
+    if model.isvw(): #then score all phrases together
+        scored_pps_all = model.score_all(heldout_data[example_idxs,:], phrases)
+    else:
+        for idx,src_phrase in enumerate(phrases): #score each phrase individually
+            scored_pps = scored_model.score(heldout_data[example_idxs[idx],:], src_phrase)
+            scored_pps_all.append(scored_pps)
+    print "Heldout: scored phrases"
+    for idx,scored_pps in enumerate(scored_pps_all): #compute MRR for scored PPs
+        if len(scored_pps) > 1: #only record MRR for src phrases with more than one translation
+            avg_length += len(scored_pps)
+            sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #sort by score to get rank
+            phrase_pair = ground_truth[idx]
+            scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0] #because we filtered for singleton PPs, guaranteed that scored_rank is not None
+            mrr += 1./scored_rank
+            multi_translation_count += 1
+            if scored_rank > 1: #separate tracking if correct translation was not ranked 1
+                mrr_hard_examples += 1./scored_rank
+                hard_examples_count += 1
     mrr /= multi_translation_count
     mrr_hard_examples /= hard_examples_count
     avg_length = float(avg_length) / multi_translation_count
+    print "Heldout: computed MRR"
     print "Time taken to evaluate held-out: %.1f sec"%(time.clock()-start)
-    print "Out of %d examples (source phrases), %d are not pruned (singleton/filtered), %d have > 1 translation (restricting scoring to these phrases)"%(len(heldout_idxs), nonsingleton_count, multi_translation_count)
+    print "Out of %d examples (source phrases), %d are not pruned (singleton/filtered), %d have > 1 translation (restricting scoring to these phrases)"%(len(heldout_idxs), len(scored_pps_all), multi_translation_count)
     print "Mean Reciprocal Rank: %.3f; Average number of translations per phrase: %.2f"%(mrr, avg_length)
     print "Mean Reciprocal Rank for phrase pairs not ranked 1: %.3f"%mrr_hard_examples
 
@@ -107,12 +119,12 @@ def extract_excluded_PPs(counts_dict, cutoff):
             for rule in rules_to_filter:
                 filtered_rule = ' ||| '.join([src_rule, rule]) #form phrase pair
                 excluded_PPs.add(filtered_rule)
-            if len(rules_to_filter) > 0:
-                print "Source phrase '%s' had %d rules, now %d"%(src_rule, original_count, cutoff) 
+            #if len(rules_to_filter) > 0:
+            #    print "Source phrase '%s' had %d rules, now %d"%(src_rule, original_count, cutoff) 
     return excluded_PPs
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:F:g:h:l:m:MNo:OpP:s:S:r:t:v:w:')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:F:g:h:l:Lm:Mo:OpP:s:S:r:t:v:w:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
@@ -135,7 +147,7 @@ def main():
     whitening = "full" #regular CCA
     mean_center = False
     concat = False
-    subset_norm = False
+    ldf = False
     heldout_frac = 0
     shrinkage_frac = 0
     for opt in opts:
@@ -163,8 +175,8 @@ def main():
             filter_features = opt[1]
         elif opt[0] == '-F':
             filter_options = opt[1].split(',')
-            if len(filter_options) != 2: 
-                sys.stderr.write("ERROR! If providing filtering information, need to provide counts file separated by filter count\n")
+            if len(filter_options) != 2:
+                sys.stderr.write("Error! If translation model filtering by P(e|f) requested, need to provide counts file and filter count threshold separated by comma ','\n")
                 sys.exit()
             filter_grammar, filter_cutoff = filter_options[0], int(filter_options[1])
         elif opt[0] == '-s': #stop word filtering
@@ -193,8 +205,8 @@ def main():
             whitening = opt[1]
         elif opt[0] == '-M': #mean-center
             mean_center = True
-        elif opt[0] == '-N': #subset normalization
-            subset_norm = True
+        elif opt[0] == '-L': 
+            ldf = True
     if phrase_pairs_loc == "" or output_loc == "": #these inputs are required
         sys.stderr.write("Error! Need to define a location for per-sentence phrase pairs and an output directory to write parameters\n")
         sys.exit() 
@@ -216,15 +228,15 @@ def main():
     if prune_tokens == 0 and estimate_oov_param is True: 
         sys.stderr.write("Error! OOV parameter estimation for tokens requested, but pruning of tokens is not enabled; set -P to a value greater than 0\n")
         sys.exit()
-    if subset_norm and method != "maxent":
-        sys.stderr.write("Error! Subset normalization only works with -m maxent\n")
-        sys.exit()
+    if ldf and method != "maxent":
+        sys.stderr.write("Error! Label-dependent features only work with -m maxent\n")
+        sys.exit()        
 
     excluded_pairs = set()
     if filter_cutoff > 0:
         counts_fh = open(filter_grammar, 'rb')
         counts_dict = cPickle.load(counts_fh)
-        counts_fh.close()
+        counts_fh.close()        
         excluded_pairs = extract_excluded_PPs(counts_dict, filter_cutoff)
     #set up data structures and extract context features and tokens from corpus
     start = time.clock()
@@ -264,10 +276,10 @@ def main():
         else:
             left_con.create_sparse_matrix(pos_depend, con_length) #take pos depend and con_length as args to make pos-dep OOV types
             right_con.create_sparse_matrix(pos_depend, con_length) #can probably simplify and remove dependence on con_length (inferred from data)
-        if not estimate_oov_param: #remove zero rows
-            zero_rows = tokens.filter_zero_rows()
-            left_con.filter_zero_rows(zero_rows)
-            right_con.filter_zero_rows(zero_rows)            
+        #if not estimate_oov_param: #remove zero rows
+        #    zero_rows = tokens.filter_zero_rows()
+        #    left_con.filter_zero_rows(zero_rows)
+        #    right_con.filter_zero_rows(zero_rows)            
         if tokens_loc != "": #write out to file if not empty
             tokens_fh = open(tokens_loc, 'wb')
             cPickle.dump(tokens, tokens_fh)
@@ -277,7 +289,9 @@ def main():
             tokens_fh.close()
     print "Number of PP tokens: %d; Number of PP types (after all pruning): %d"%(tokens.get_token_matrix().shape[0], tokens.get_token_matrix().shape[1])
     print "Number of PPs seen (incl. singletons, excl. filtered rules): %d"%len(all_phrase_pairs)
+    print "Number of excluded rules (filtered out): %d"%len(excluded_pairs)
     print "Left context dim: %d; Right context dim: %d"%(left_con.get_token_matrix().shape[1], right_con.get_token_matrix().shape[1])
+
     heldout_idxs = None
     train_idxs = None
     if heldout_frac > 0 or shrinkage_frac > 0:
@@ -287,7 +301,7 @@ def main():
         sample_size = int(frac_to_select*num_tokens)
         heldout_idxs = sorted(random.sample(xrange(num_tokens), sample_size))
         train_idxs = list(set(xrange(num_tokens)) - set(heldout_idxs))
-        print "Selected %d out of %d samples for held-out set"%(sample_size, num_tokens)
+        print "Selected %d out of %d samples for held-out set (some are zero rows)"%(sample_size, num_tokens)
 
     context = None
     left_con_train = left_con.get_token_matrix(train_idxs) if train_idxs is not None else left_con.get_token_matrix()
@@ -303,7 +317,8 @@ def main():
             cPickle.dump(context, context_fh)
             context_fh.close()
     lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con_train, right_con_train)
-    print "Computed/loaded context representations"
+    print "Computed/loaded context representations. Starting model training."
+
     #compute parameters for low-rank phrase disambiguation model
     model = None
     training_labels = tokens.get_token_matrix(train_idxs) if train_idxs is not None else tokens.get_token_matrix()
@@ -313,9 +328,9 @@ def main():
     elif method == "glm":
         model = GLM(context, tokens.get_type_map(), all_phrase_pairs)
         model.train(lr_mat_l, lr_mat_r, training_labels, gamma2)
-    elif method == "maxent": #multinomial logistic regression
-        model = MaxEnt(context, tokens.get_type_map(), all_phrase_pairs, subset_norm)
-        model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, tokens.id_type_map)
+    elif method == "maxent": #multilcass logistic regression
+        model = MaxEnt(context, tokens.get_type_map(), all_phrase_pairs, ldf)
+        model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, tokens.id_type_map, os.path.dirname(output_loc))
     elif method == "mlp":
         model = MLP(context, tokens.get_type_map(), all_phrase_pairs, gamma2, rank2)
         model.train(lr_mat_l, lr_mat_r, training_labels)
@@ -325,11 +340,12 @@ def main():
     if heldout_frac > 0 or shrinkage_frac > 0: #evaluate held-out if requested
         print "Starting heldout evaluation"
         lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con.get_token_matrix(heldout_idxs), right_con.get_token_matrix(heldout_idxs))    
-        score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model, method, estimate_oov_param)
+        score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model)
         if shrinkage_frac > 0:
             model.shrink_estimates(lr_mat_l, lr_mat_r, tokens, heldout_idxs)
-            score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model, method, estimate_oov_param) #score again to see improvement    
+            score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model) #score again to see improvement    
     print "Model training complete"
+
     start = time.clock()
     out_fh = open(output_loc, 'wb')
     cPickle.dump(model, out_fh)
