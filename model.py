@@ -1,6 +1,6 @@
 #!/usr/bin/python -tt
 
-import sys, commands, string, os, time, gzip
+import sys, commands, string, os, time, gzip, cPickle, math
 import numpy as np
 import scipy.sparse as sp
 import scipy.io as io
@@ -10,13 +10,20 @@ from mlp import MLPClassifier
 
 def compute_regression(X, Y, reg_strength):
     pwd = os.getcwd()
-    out_loc = pwd + "/matlab_temp"
-    io.savemat(out_loc, {'X': X, 'Y': Y})
+    out_locX1 = pwd + "/x1"
+    out_locX2 = pwd + "/x2"
+    #file is large: split into 2
+    N = X.shape[0] / 2
+    io.savemat(out_locX1, {'X1': X[:N,:]})
+    io.savemat(out_locX2, {'X2': X[N:,:]})
+    out_locY = pwd + "/y"
+    io.savemat(out_locY, {'Y': Y})
     path = os.path.abspath(os.path.dirname(sys.argv[0])) #matlab scripts in the same place as this script
     os.chdir(path+"/matlab")
-    os.system('matlab -nodesktop -nosplash -nojvm -r "regression_wrapper ' + out_loc + " %s"%reg_strength + '"')
+    command = 'matlab -nodesktop -nosplash -nojvm -r "regression_wrapper ' + "%s %s %s %s"%(out_locX1, out_locX2, out_locY, reg_strength) + '"'
+    os.system(command)
     os.chdir(pwd)
-    mat_return = io.loadmat(out_loc)
+    mat_return = io.loadmat(out_locY)
     return mat_return['beta']
 
 def compute_cca(X, Y, reg_strength, rank, approx, mean_center):
@@ -58,17 +65,24 @@ def compute_cca(X, Y, reg_strength, rank, approx, mean_center):
         cross_cov.data *= cross_cov.data > 0 #filtering out non-zeros
         cross_cov.eliminate_zeros()
     if approx == "full":
-        io.savemat(out_loc, {'X': X, 'Y': Y})
+        out_locX1 = pwd + "/x1"
+        out_locX2 = pwd + "/x2"
+        #file is large: split into 2
+        N = X.shape[0] / 2
+        io.savemat(out_locX1, {'X1': X[:N,:]})
+        io.savemat(out_locX2, {'X2': X[N:,:]})
+        out_locY = pwd + "/y"
+        io.savemat(out_locY, {'Y': Y})
         path = os.path.abspath(os.path.dirname(sys.argv[0])) 
         os.chdir(path+"/matlab") #matlab scripts in 'matlab' sub-directory
-        os.system('matlab -nodesktop -nosplash -nojvm -r "cca_wrapper ' + out_loc + " %s %s"%(rank, reg_strength) + '"')        
+        os.system('matlab -nodesktop -nosplash -nojvm -r "cca_wrapper ' + "%s %s %s %s %s"%(out_locX1, out_locX2, out_locY, rank, reg_strength) + '"')  
     else:
         io.savemat(out_loc, {'avgOP': cross_cov})
         path = os.path.abspath(os.path.dirname(sys.argv[0])) 
         os.chdir(path+"/matlab")
         os.system('matlab -nodesktop -nosplash -nojvm -r "matlab_svd ' + out_loc + " %s"%rank + '"')
     os.chdir(pwd)
-    mat_return = io.loadmat(out_loc)
+    mat_return = io.loadmat(out_locY) if approx == "full" else io.loadmat(out_loc)
     if approx == "diag": #if diag approx, multiply result by scaling
         return whiten_left.dot(mat_return['U']), whiten_right.dot(mat_return['V']), mat_return['S']
     else: #for full CCA, already scaled in cca_direct.m
@@ -152,6 +166,8 @@ class BaseModel(object):
         self.context = context
         self.inventory = self.__format_phrase_pairs(list(all_pp))
         self.is_vw = is_vw
+        self.discretize_context = False
+        self.discretize_phrasereps = False
 
     def __format_phrase_pairs(self, phrase_pairs):
         phrase_dict = {}
@@ -198,8 +214,37 @@ class BaseModel(object):
             phrase_pairs.append(phrase_pair)
         return idxs, phrase_pairs
 
+    def set_context_means(self, pos_means, neg_means):
+        self.context.pos_means = pos_means
+        self.context.neg_means = neg_means
+        self.discretize_context= True
+        
+    def set_phraserep_means(self, pos_means, neg_means):
+        self.pos_means = pos_means
+        self.neg_means = neg_means
+        self.discretize_phrasereps = True
+
     def isvw(self):
         return self.is_vw
+
+    def rep2str(self, rep, prefix):
+        str_rep = []
+        for idx,val in enumerate(rep):
+            if prefix == "c" and self.discretize_context: 
+                if val > 0:
+                    new_val = 0 if val <= self.context.pos_means[idx] else 1
+                else:
+                    new_val = 0 if val >= self.neg_means[idx] else 1
+                str_rep.append("%s_dim%d=%d"%(prefix,idx,new_val))
+            elif prefix == "pp" and self.discretize_phrasereps:
+                if val > 0:
+                    new_val = 0 if val <= self.pos_means[idx] else 1
+                else:
+                    new_val = 0 if val >= self.neg_means[idx] else 1
+                str_rep.append("%s_dim%d=%d"%(prefix,idx,new_val))
+            else: #output raw value
+                str_rep.append("%s_dim%d=%.3g"%(prefix,idx,val))
+        return ' '.join(str_rep)
 
 class CCA(BaseModel):
     def __init__(self, context, type_map, all_pp):
@@ -209,39 +254,55 @@ class CCA(BaseModel):
     def train(self, left_low_rank, right_low_rank, training_labels, gamma, rank, approx, mean_center):
         training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
         phi_s, phi_w, cw_correlations = compute_cca(training_data, training_labels, gamma, rank, approx, mean_center)
+        #over here, if discretize flag on, then compute + and - means of trianing data
         self.context_parameters = phi_s
         self.parameters = phi_w
         print "Two-step CCA complete. Correlations between combined context and tokens (with rank %d): "%rank
         print cw_correlations
 
-    def score(self, context_rep, phrase):
+    def score(self, context_rep, phrase, print_reps):
         bidi_con_rep = context_rep.dot(self.context_parameters)
         bidi_con_rep_norm = np.linalg.norm(bidi_con_rep)
         translations = self.inventory[phrase] #this pulls up all phrase pairs, incl. singletons
         scored_pairs = []
+        rep_str = ""
+        if print_reps:
+            rep_str += self.rep2str(bidi_con_rep, "c")
         for translation in translations:
             phrase_pair = ' ||| '.join([phrase, translation])
             representation = self.get_representation(phrase_pair) #if representation is None, score is None
             rep_norm = np.linalg.norm(representation) if representation is not None else 0
             score = None if (representation is None or rep_norm == 0) else representation.dot(bidi_con_rep.transpose()) / (rep_norm*bidi_con_rep_norm)
-            scored_pairs.append((phrase_pair, score))
+            if score is not None: #add the phrase pair representation also
+                rep_str_trans = rep_str +  " " + self.rep2str(representation, "pp") if print_reps else ""
+                scored_pairs.append((phrase_pair, score, rep_str_trans))
+            else:
+                scored_pairs.append((phrase_pair, score, rep_str))
         return scored_pairs
-
-class MaxEnt(BaseModel):
-    def __init__(self, context, type_map, all_pp, ldf):
-        super(MaxEnt, self).__init__(type_map, all_pp, context, True)
+    
+class MLR(BaseModel):
+    def __init__(self, context, type_map, all_pp, ldf, high_dim):
+        super(MLR, self).__init__(type_map, all_pp, context, True)
         self.ldf = {} if ldf else None
         self.model_loc = ""
+        self.high_dim = high_dim
 
     def __label_features(self, features, src_id):
-        left_row, right_row = np.split(features,2)
+        left_row, right_row = np.split(features,2) #will this work with high_dim? 
         left_labeled = [("l%d"%(idx+1), val)  for idx,val in enumerate(left_row)] 
         right_labeled = [("r%d"%(idx+1), val)  for idx,val in enumerate(right_row)]
-        feature_str = ' '.join(["%s_%d:%.5f"%(feat_label, src_id, feat_val) for feat_label,feat_val in left_labeled+right_labeled]) if src_id > -1 else ' '.join(["%s:%.5f"%(feat_label, feat_val) for feat_label,feat_val in left_labeled+right_labeled])
+        feature_str = ' '.join(["%s_%d:%.5g"%(feat_label, src_id, feat_val) for feat_label,feat_val in left_labeled+right_labeled]) if src_id > -1 else ' '.join(["%s:%.5g"%(feat_label, feat_val) for feat_label,feat_val in left_labeled+right_labeled])
         return feature_str
+
+    def __label_features_sparse(self, left, right):
+        dummy, cols_left = left.nonzero()
+        left_labeled = ["L%d"%col_idx for col_idx in cols_left]
+        dummy, cols_right = right.nonzero()
+        right_labeled = ["R%d"%col_idx for col_idx in cols_right]
+        return ' '.join(left_labeled + right_labeled)
     
-    def __decorate_labels(self, phrase_id, src_phrase, pp_counts):
-        col_idxs, phrase_pairs = self.get_candidate_indices(src_phrase)
+    def __decorate_labels(self, phrase_id, src_phrase, pp_counts, uniform_cost):
+        col_idxs, phrase_pairs = self.get_candidate_indices(src_phrase) # over here, breaks when unk
         col_idxs = [idx for idx in col_idxs if idx != -1] #remove candidates that we can't score
         normalizer = np.sum(pp_counts[0,col_idxs]) - pp_counts[0,phrase_id] 
         if normalizer == 0 and len(col_idxs) > 1:
@@ -250,95 +311,158 @@ class MaxEnt(BaseModel):
         idx_in_col_idxs = False
         for idx in col_idxs:
             if idx == phrase_id:
-                labels.append("%d:0"%idx)
+                labels.append("%d:0.0"%idx)
                 idx_in_col_idxs = True
             else:                
-                cost = float(pp_counts[0,idx]) / normalizer
-                labels.append("%d:%.3g"%(idx,cost))        
+                #cost = 1.0 if uniform_cost else float(pp_counts[0,idx] + 1)
+                #cost = 1./ len(col_idxs) if uniform_cost else float(pp_counts[0,idx]) / normalizer
+                cost = 1.0 if uniform_cost else float((pp_counts[0,idx]+1)*len(col_idxs)) / normalizer #scale normalized counts by num translations
+                labels.append("%d:%.1f"%(idx,cost))        
         assert idx_in_col_idxs == True
         return ' '.join(labels)
 
-    def train(self, left_low_rank, right_low_rank, training_labels, gamma, id_type_map, out_dir):
+    def train(self, left_low_rank, right_low_rank, training_labels, gamma, id_type_map, out_dir, uniform_cost):
         marker = "ldf" if self.ldf is not None else "cost"
+        if uniform_cost:
+            marker += ".uniform"
+        marker = "shuffle.cost.uniform"
         out_loc = out_dir + "/vw_train.%s.gz"%marker
-        out_fh = gzip.open(out_loc, 'wb')
-        N = training_labels.shape[0] 
+        pp_counts = training_labels.sum(axis=0) #cost function for negative examples depends on this            
+        N = training_labels.shape[0]             
         start = time.clock()
-        training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
-        pp_counts = training_labels.sum(axis=0) #cost function for negative examples depends on this
-        for row_idx in xrange(N): #may want to add a counter here
-            label_row, label_col = training_labels[row_idx,:].nonzero()
-            if len(label_col) == 1: #can be zero rows
-                phrase_pair = id_type_map[label_col[0]]
-                src_phrase = phrase_pair.split(' ||| ')[0]
-                src_id = -1
-                if self.ldf is not None:
-                    if src_phrase not in self.ldf:
-                        src_id = len(self.ldf)
-                        self.ldf[src_phrase] = src_id
-                    src_id = self.ldf[src_phrase]
-                feature_str = self.__label_features(training_data[row_idx,:], src_id)
-                label_str = self.__decorate_labels(label_col[0], src_phrase, pp_counts)
-                if self.ldf is not None: #write out in multi-line format
-                    labels = label_str.split()
-                    #out_fh.write("shared | %s\n"%feature_str)
-                    for label in labels:
-                        out_fh.write("%s | %s\n"%(label, feature_str))
-                    out_fh.write("\n")
-                else:
-                    out_fh.write("%s | %s\n"%(label_str, feature_str))
-        out_fh.close()
-        print "Assembled training data into VW format and wrote out to %s. Starting VW training..."%out_loc
-        self.model_loc = out_dir+"/maxent.%1g.model"%gamma
-        vw_command = 'vw %s --compressed -c -f %s --csoaa %d --l2 %.1g --passes 5'%(out_loc, self.model_loc, pp_counts.shape[1], gamma) if self.ldf is None else 'vw %s --compressed -c -f %s --wap_ldf m --loss_function logistic --l2 %.1g --passes 5'%(out_loc, self.model_loc, gamma)
-        print "Running command: %s"%vw_command
-        os.system(vw_command)
-        print "VW training complete. Model located in %s"%self.model_loc
-        print "MaxEnt Classifier (multiclass logistic regression) complete. Time: %.1f sec"%(time.clock()-start)
+        if not os.path.isfile(out_loc): #if training data for VW has not been written out to file
+            out_fh = gzip.open(out_loc, 'wb')
+            training_data = np.hstack((left_low_rank, right_low_rank)) #should work with both dense and sparse matrices
+            #training_data = np.concatenate((left_low_rank, right_low_rank), axis=1) #will this work if inputs are high dim??
+            for row_idx in xrange(N): #may want to add a counter here
+                label_row, label_col = training_labels[row_idx,:].nonzero()
+                if len(label_col) == 1: #can be zero rows
+                    phrase_pair = id_type_map[label_col[0]]
+                    src_phrase = phrase_pair.split(' ||| ')[0]
+                    src_id = -1
+                    if self.ldf is not None:
+                        if src_phrase not in self.ldf:
+                            src_id = len(self.ldf)
+                            self.ldf[src_phrase] = src_id
+                        src_id = self.ldf[src_phrase]
+                    feature_str = self.__label_features_sparse(left_low_rank[row_idx,:], right_low_rank[row_idx,:]) if self.high_dim else self.__label_features(training_data[row_idx,:], src_id)
+                    label_str = self.__decorate_labels(label_col[0], src_phrase, pp_counts, uniform_cost) if src_phrase != "<unk>" else "%d:0.0"%label_col[0]
+                    if self.ldf is not None: #write out in multi-line format
+                        labels = label_str.split()
+                        #out_fh.write("shared | %s\n"%feature_str)
+                        for label in labels:
+                            out_fh.write("%s | %s\n"%(label, feature_str))
+                        out_fh.write("\n")
+                    else:
+                        out_fh.write("%s | %s\n"%(label_str, feature_str))
+            out_fh.close()
+            if self.ldf is not None: #write out dictionary that maps source phrases to IDs (for feature decoration in LDF)
+                out_fh = open(out_dir+"/vw_ldf.srcphr.dict", 'wb')
+                cPickle.dump(self.ldf, out_fh)
+                out_fh.close()
+                print "For label-dependent features: wrote out src phrase to ID dictionary"
+            print "Assembled training data into VW format and wrote out to %s. Starting VW training..."%out_loc
+        else:
+            if self.ldf is not None: #load dictionary that maps source phrases to IDs (for feature decoration in LDF)
+                in_fh = open(out_dir+"/vw_ldf.srcphr.dict", 'rb')
+                self.ldf = cPickle.load(in_fh)
+                in_fh.close()
+                print "For label-dependent features: read in src phrase to ID dictionary"
+            print "Already wrote training data to %s.  Starting VW training..."%out_loc
+
+        #self.model_loc = out_dir+"/mlr.%1g.model"%gamma
+        self.model_loc = out_dir+"/mlr.shuffle.model"
+        if not os.path.isfile(self.model_loc): #if model does not exist, train it
+            vw_command = ""
+            if self.ldf is None:                
+                vw_command = 'vw %s --compressed -c -f %s --csoaa %d --l2 %.1g --passes 2 --holdout_off'%(out_loc, self.model_loc, pp_counts.shape[1], gamma)
+            else:
+                num_features = left_low_rank.shape[1] + right_low_rank.shape[1]
+                ring_size = int(math.ceil(math.log(num_features*len(self.ldf), 2)) + 1)
+                vw_command = 'vw %s --compressed -c -f %s --csoaa_ldf mc --loss_function logistic --l2 %.1g -b %d --passes 2 --holdout_off'%(out_loc, self.model_loc, gamma, ring_size)
+            assert vw_command != ""
+            print "Running command: %s"%vw_command
+            os.system(vw_command)
+            print "VW training complete. Model located in %s"%self.model_loc
+        else:
+            print "Model %s already trained, no need to run VW training"%self.model_loc
+        print "Multinomial Logistic Regression through VW complete. Time: %.1f sec"%(time.clock()-start)
+
+    def __format_multiline(self, ml_pred, ml_scores):
+        new_scores = []
+        new_pred = []
+        per_line_scores = []
+        for idx,line in enumerate(ml_pred):
+            if line.strip() != "":
+                class_val = int(line.strip().split('.')[0])
+                if class_val != 0: #predicted class
+                    new_pred.append(class_val)
+                label_str, score_str = ml_scores[idx].split(':')
+                per_line_scores.append((int(label_str), float(score_str)))
+            else: #assemble per_line_scores
+                new_scores.append(per_line_scores)
+                per_line_scores = []
+        return new_pred, new_scores
         
     '''score_all takes a list of phrases and a matrix of context_reps and returns a list of lists: each list contains phrase pair-score tuples'''
-    def score_all(self, context_reps, phrases):
+    def score_all(self, context_reps, phrases, sent_num, print_reps):
         assert context_reps.shape[0] == len(phrases)
-        dir_loc = os.path.dirname(self.model_loc)
-        ex_fh = open(dir_loc+"/test.examples", 'wb')
+        dir_loc = os.path.dirname(self.model_loc) #write temporary files in the same directory as model
+        file_id = str(sent_num)
+        ex_filename = dir_loc + "/test.examples.%s"%file_id
+        ex_predictions = dir_loc + "/test.predictions.%s"%file_id
+        ex_scores = dir_loc + "/test.scores.%s"%file_id
+        ex_fh = open(ex_filename, 'wb') #here: need to provide unique ID for filename
         for idx,phrase in enumerate(phrases): #write out all test examples to file
-            context_rep = context_reps[idx,:]
-            src_id = self.ldf[phrase] if self.ldf is not None else -1            
-            feature_str = self.__label_features(context_rep, src_id) #decorate with src info if requested
+            context_rep = context_reps[idx,:] #context_rep could be sparse here
             col_idxs, phrase_pairs = self.get_candidate_indices(phrase)
-            col_idxs_filt = [idx for idx in col_idxs if idx != -1]
-            label_str = ' '.join(["%d:0"%col_idx for col_idx in col_idxs_filt]) #cost information ignored during test time
+            col_idxs = [idx for idx in col_idxs if idx != -1] #could be empty if all phrase pairs are less than threshold or have been pruned
+            label_str = ' '.join(["%d"%col_idx for col_idx in col_idxs])
             if self.ldf is not None: 
                 labels = label_str.split()
-                #print >> ex_fh, "shared | %s"%feature_str
+                src_id = self.ldf[phrase] if phrase in self.ldf else 0 #will not be in ldf srcphrase dictionary if all examples of pp are in heldout
+                feature_str = self.__label_features(context_rep, src_id)
                 for label in labels:
-                    print >> ex_fh, "%s | %s"%(label, feature_str)
+                    print >> ex_fh, "%s | %s "%(label, feature_str)
+                print >> ex_fh, ""
             else:
-                print >> ex_fh, "%s | %s"%(label_str, feature_str)
+                feature_str = self.__label_features(context_rep, -1)
+                print >> ex_fh, "%s | %s "%(label_str, feature_str)
         ex_fh.close()
-        vw_command = 'vw --quiet -i %s -t -p %s -r %s < %s'%(self.model_loc, dir_loc+"/test.predictions", dir_loc+"/test.scores", dir_loc+"/test.examples")
+        vw_command = 'vw --quiet -i %s -t -p %s -r %s < %s'%(self.model_loc, ex_predictions, ex_scores, ex_filename)
         os.system(vw_command)
-        pred_fh = open(dir_loc+"/test.predictions", 'rb')
-        predictions = [int(line.strip().split('.')[0]) for line in pred_fh.readlines()]
+        if self.ldf is None: #for non LDF 
+            os.system("sed '/^$/d' %s"%ex_scores) #just in case, NN outputs have empty lines
+
+        pred_fh = open(ex_predictions, 'rb')
+        predictions_raw = [line.strip() for line in pred_fh.readlines()]
         pred_fh.close()
-        scores_fh = open(dir_loc+"/test.scores", 'rb')
+        scores_fh = open(ex_scores, 'rb')
         scores_raw = [line.strip() for line in scores_fh.readlines()]
         scores_fh.close()
-        assert len(predictions) == len(scores_raw) == len(phrases)
+        predictions = []
+        scores = []
+        if self.ldf is not None:
+            predictions, scores = self.__format_multiline(predictions_raw, scores_raw)
+        else:
+            predictions = [int(label.split('.')[0]) for label in predictions_raw]
+            #below, why '-score'? because in VW, the score is the cost of each class, so higher means less probable
+            for line in scores_raw:
+                scores.append([(int(col_score_pair.split(':')[0]), -float(col_score_pair.split(':')[1])) for col_score_pair in line.split()])
+                #scores.append([(int(col_score_pair.split(':')[0]), expit(-float(col_score_pair.split(':')[1]))) for col_score_pair in line.split()])
+        assert len(predictions) == len(scores) == len(phrases)
         scored_pps_all = []
-        for idx,line in enumerate(scores_raw): #convert VW outputs to list of phrase pair/score tuples
+        for idx,scores_list in enumerate(scores): #convert VW outputs to list of phrase pair/score tuples
             phrase = phrases[idx]
+            context_rep = context_reps[idx,:]
             col_idxs, phrase_pairs = self.get_candidate_indices(phrase)
             scored_pps = []            
-            #why expit(-score)? because in cost-sensitive OAA, cost of each class, so higher means less probable
-            #scores_list = [(int(col_score_pair.split(':')[0]), expit(-float(col_score_pair.split(':')[1]))) for col_score_pair in line.split()]     
-            scores_list = [(int(col_score_pair.split(':')[0]), -float(col_score_pair.split(':')[1])) for col_score_pair in line.split()]     
             scored_dict = None
-            if len(scores_list) > 0:                
-                prediction_score = max(scores_list, key = lambda x:x[1])[0]
+            if len(scores_list) > 0: #at least one score, so that means that at least one of the phrase pairs has been estimated
+                prediction_score = max(scores_list, key = lambda x:x[1])[0] #what if it's flat? max outputs the first one
                 prediction = predictions[idx]
                 if prediction_score != prediction: #should add epsilon to the right answer because it's all flat right now
-                    epsilon = 0.0001
+                    epsilon = 1e-5
                     new_scores_list = []
                     for phrase_id, score in scores_list:
                         if phrase_id == prediction: 
@@ -347,13 +471,15 @@ class MaxEnt(BaseModel):
                             new_scores_list.append((phrase_id, score))
                     scores_list = new_scores_list
                 scored_dict = dict(scores_list) 
-            for real_idx, phrase_pair in enumerate(phrase_pairs):
-                if col_idxs[real_idx] >= 0: #phrase pair can be scored, and guaranteed that scored dict is not none (maybe assert?)
+            representation = self.rep2str(context_rep, "c") if print_reps else ""
+            for real_idx, phrase_pair in enumerate(phrase_pairs): #convert to standard representation that interface expects
+                if col_idxs[real_idx] >= 0: #phrase pair can be scored, and guaranteed that scored dict is not None
                     score = scored_dict[col_idxs[real_idx]]
-                    scored_pps.append((phrase_pair, score))
+                    scored_pps.append((phrase_pair, score, representation))
                 else:
-                    scored_pps.append((phrase_pair, None))
+                    scored_pps.append((phrase_pair, None, representation))
             scored_pps_all.append(scored_pps)
+        os.system('rm %s; rm %s; rm %s'%(ex_filename, ex_predictions, ex_scores))
         return scored_pps_all
 
 class GLM(BaseModel):
@@ -367,21 +493,24 @@ class GLM(BaseModel):
         self.parameters = compute_regression(training_data, training_labels, gamma)
         print "Fitted general linear model: %d responses %d predictors, %d samples"%(self.parameters.shape[1], self.parameters.shape[0], left_low_rank.shape[0])
 
-    def score(self, context_rep, phrase): 
+    def score(self, context_rep, phrase, print_reps): 
         col_idxs, phrase_pairs = self.get_candidate_indices(phrase) #some of the col_idxs may be -1 
         aug_context_rep = np.append(context_rep, np.ones((1,)))
         if self.alphas is not None: #then element-wise multiply with alpha vec
             assert self.alphas.shape == aug_context_rep.shape
             aug_context_rep *= self.alphas
         scored_pps = []
+        rep_str = ""
+        if print_reps:
+            rep_str += self.rep2str(context_rep, "c")
         for real_idx, phrase_pair in enumerate(phrase_pairs): #col_idxs has -1 mixed in, so can't just multiply regularly
             if col_idxs[real_idx] >= 0: #phrase pair can be scored
-                score = aug_context_rep.dot(self.parameters[:,col_idxs[real_idx]])
-                #if score < 0:                    
-                #    score = 0
-                scored_pps.append((phrase_pair, score))
+                parameter = self.parameters[:,col_idxs[real_idx]]
+                score = aug_context_rep.dot(parameter)
+                rep_str_trans = rep_str + " " + self.rep2str(parameter, "pp") if print_reps else ""
+                scored_pps.append((phrase_pair, score, rep_str_trans))
             else:
-                scored_pps.append((phrase_pair, None))        
+                scored_pps.append((phrase_pair, None, rep_str))        
         return scored_pps
 
     def shrink_estimates(self, left_low_rank, right_low_rank, tokens, heldout_idxs): 
@@ -436,19 +565,20 @@ class MLP(BaseModel):
         self.mlp.fit(training_data, training_labels)
         print "MLP learning complete; input layer size: %d; hidden layer size: %d; output layer size: %d; time: %.1f sec"%(training_data.shape[1], self.mlp.n_hidden, tokens.get_token_matrix().shape[1], time.clock()-start)
         
-    def score(self, context_rep, phrase):
+    def score(self, context_rep, phrase, print_reps):
         predict_vec = self.mlp.predict(context_rep)        
         if predict_vec.shape[0] == 1: #single row vector
             predict_vec = np.reshape(predict_vec, (predict_vec.shape[1],))
         translations = self.inventory[phrase]
         scored_pairs = []
+        rep_str = ""
+        if print_reps:
+            rep_str += self.rep2str(context_rep, "c")
         for translation in translations:
             phrase_pair = ' ||| '.join([phrase, translation])
             pp_id = self.get_tokenID(phrase_pair)
             if pp_id > 0:
                 score = vec[pp_id]
-                if score < 0:
-                    score = 0
                 scored_pairs.append((phrase_pair, score))
             else:
                 scored_pairs.append((phrase_pair, None))

@@ -13,15 +13,7 @@ out for subsequent decoding/evaluation.
 arg0: config file - defines output location of parameters (same config given to decoder)
 arg1: directory location of sentence-specific phrase pairs (in .gz format; output of extract 
 STDIN: training corpus (can be parallel or just source)
-Flags:
--l arg: change context length (default is 2 i.e., 2 words on each side)
--r arg: change rank (default is 50); to decouple rank, provide two ranks separated by a comma e.g., '100,50'
--k arg: enable re-scaling of features based on diagonal approximation to covariance, with an additional scaling factor (default: disabled)
--p: make context features position-dependent
--s arg: filter stop words, provided in arg (list of words to remove)
--f arg: filter to words provided in arg; if they contain stop words and stop words is enabled, then they will be removed
--c arg: write out counts in cPickle format to location specified by arg
--o arg: compute OOV parameter by removing freatures with count <= arg and replacing them with <unk> token
+Flags: see README.md for more details
 '''
 
 import sys, commands, string, gzip, getopt, os, cPickle, time, random
@@ -71,6 +63,7 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
     phrases = []
     ground_truth = []
     example_idxs = []
+    heldout_set = set(heldout_idxs)
     for idx, test_idx in enumerate(heldout_idxs): #assemble phrases
         rows, cols = tokens.get_token_matrix()[test_idx,:].nonzero()
         if len(cols) == 1: #if it is not a zero row, otherwise it has been pruned
@@ -83,10 +76,10 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
     print "Heldout: assembled phrases that can be scored"
     scored_pps_all = [] #all src phrases
     if model.isvw(): #then score all phrases together
-        scored_pps_all = model.score_all(heldout_data[example_idxs,:], phrases)
+        scored_pps_all = model.score_all(heldout_data[example_idxs,:], phrases, 0, False)
     else:
         for idx,src_phrase in enumerate(phrases): #score each phrase individually
-            scored_pps = scored_model.score(heldout_data[example_idxs[idx],:], src_phrase)
+            scored_pps = model.score(heldout_data[example_idxs[idx],:], src_phrase)
             scored_pps_all.append(scored_pps)
     print "Heldout: scored phrases"
     for idx,scored_pps in enumerate(scored_pps_all): #compute MRR for scored PPs
@@ -119,12 +112,10 @@ def extract_excluded_PPs(counts_dict, cutoff):
             for rule in rules_to_filter:
                 filtered_rule = ' ||| '.join([src_rule, rule]) #form phrase pair
                 excluded_PPs.add(filtered_rule)
-            #if len(rules_to_filter) > 0:
-            #    print "Source phrase '%s' had %d rules, now %d"%(src_rule, original_count, cutoff) 
     return excluded_PPs
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:F:g:h:l:Lm:Mo:OpP:s:S:r:t:v:w:')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:F:g:h:Hl:Lm:Mo:OpP:s:S:r:t:uv:w:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
@@ -148,8 +139,10 @@ def main():
     mean_center = False
     concat = False
     ldf = False
+    uniform_cost = False
     heldout_frac = 0
     shrinkage_frac = 0
+    high_dim = False
     for opt in opts:
         if opt[0] == '-l': #context length 
             con_length = int(opt[1])
@@ -187,7 +180,7 @@ def main():
             prune_tokens = int(opt[1])
         elif opt[0] == '-O':
             estimate_oov_param = True
-        elif opt[0] == '-m': #method - one of 'cca', 'glm', or 'mlp'
+        elif opt[0] == '-m': #method - one of 'cca', 'glm', 'mlr', or 'mlp'
             method = opt[1]
         elif opt[0] == '-c': #concatenation models (instead of additive)
             concat = True
@@ -207,6 +200,10 @@ def main():
             mean_center = True
         elif opt[0] == '-L': 
             ldf = True
+        elif opt[0] == '-u': #uniform cost
+            uniform_cost = True
+        elif opt[0] == '-H': #high-dimensional
+            high_dim = True
     if phrase_pairs_loc == "" or output_loc == "": #these inputs are required
         sys.stderr.write("Error! Need to define a location for per-sentence phrase pairs and an output directory to write parameters\n")
         sys.exit() 
@@ -225,12 +222,21 @@ def main():
     if not (whitening == "identity" or whitening == "full" or whitening == "diag" or whitening == "ppmi"):
         sys.stderr.write("Error! Whitening values can only be 'identity', 'full' (inverse square root), 'diag' (approximation to inverse square root), or 'ppmi' (PPMI scaling)\n")
         sys.exit()
+    if not (method == "cca" or method == "glm" or method == "mlr" or method == "mlp"):
+        sys.stderr.write("Error! Currently supported supervised methods are 'cca', 'glm', 'mlr', lr 'mlp'\n")
+        sys.exit()
     if prune_tokens == 0 and estimate_oov_param is True: 
         sys.stderr.write("Error! OOV parameter estimation for tokens requested, but pruning of tokens is not enabled; set -P to a value greater than 0\n")
         sys.exit()
-    if ldf and method != "maxent":
-        sys.stderr.write("Error! Label-dependent features only work with -m maxent\n")
-        sys.exit()        
+    if ldf and method != "mlr":
+        sys.stderr.write("Warning! Label-dependent features only work with -m mlr. Ignoring...\n")
+        ldf = False
+    if uniform_cost and method != "mlr":
+        sys.stderr.write("Warning! Uniform cost only works with -m mlr. Ignoring...\n")
+        uniform_cost = False
+    if high_dim and method != "mlr":
+        sys.stderr.write("Warning! High-dimensional features only work with -m 'mlr'.  Ignoring...\n")
+        high_dim = False
 
     excluded_pairs = set()
     if filter_cutoff > 0:
@@ -324,13 +330,18 @@ def main():
     training_labels = tokens.get_token_matrix(train_idxs) if train_idxs is not None else tokens.get_token_matrix()
     if method == "cca":
         model = CCA(context, tokens.get_type_map(), all_phrase_pairs)
+        if whitening == "ppmi": #can't do PPMI again because dense context representations have negative values
+            whitening = "full"
         model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, rank2, whitening, mean_center)
     elif method == "glm":
         model = GLM(context, tokens.get_type_map(), all_phrase_pairs)
         model.train(lr_mat_l, lr_mat_r, training_labels, gamma2)
-    elif method == "maxent": #multilcass logistic regression
-        model = MaxEnt(context, tokens.get_type_map(), all_phrase_pairs, ldf)
-        model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, tokens.id_type_map, os.path.dirname(output_loc))
+    elif method == "mlr": #multilcass logistic regression
+        model = MLR(context, tokens.get_type_map(), all_phrase_pairs, ldf, high_dim)
+        if high_dim:
+            model.train(left_con_train, right_con_train, training_labels, gamma2, tokens.id_type_map, os.path.dirname(output_loc), uniform_cost)
+        else:
+            model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, tokens.id_type_map, os.path.dirname(output_loc), uniform_cost)
     elif method == "mlp":
         model = MLP(context, tokens.get_type_map(), all_phrase_pairs, gamma2, rank2)
         model.train(lr_mat_l, lr_mat_r, training_labels)

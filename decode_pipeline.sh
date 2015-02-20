@@ -22,10 +22,15 @@ mkdir ${working}/feat-dev/
 python ${scripts}/utils/featurize_rules.py -a -s ${working}/score-dev/ ${working}/feat-dev/ $counts $lexModel $numProc 
 python ${scripts}/utils/corpus2sgm.py ${working}/feat-dev/ < $devSrcTgt > ${working}/dev.sgm
 
-python ${scripts}/decode.py -n $params ${working}/score-dev/ $numProc < ${working}/dev.src 
-mkdir ${working}/feat-dev-norm/
-python ${scripts}/utils/featurize_rules.py -a -s ${working}/score-dev/ ${working}/feat-dev-norm/ $counts $lexModel $numProc 
-python ${scripts}/utils/corpus2sgm.py ${working}/feat-dev-norm/ < $devSrcTgt > ${working}/dev_norm.sgm
+python ${scripts}/decode.py -n exp $params ${working}/score-dev/ $numProc < ${working}/dev.src 
+mkdir ${working}/feat-dev-expnorm/
+python ${scripts}/utils/featurize_rules.py -a -s ${working}/score-dev/ ${working}/feat-dev-expnorm/ $counts $lexModel $numProc 
+python ${scripts}/utils/corpus2sgm.py ${working}/feat-dev-expnorm/ < $devSrcTgt > ${working}/dev_expnorm.sgm
+
+python ${scripts}/decode.py -n range $params ${working}/score-dev/ $numProc < ${working}/dev.src 
+mkdir ${working}/feat-dev-rangenorm/
+python ${scripts}/utils/featurize_rules.py -a -s ${working}/score-dev/ ${working}/feat-dev-rangenorm/ $counts $lexModel $numProc 
+python ${scripts}/utils/corpus2sgm.py ${working}/feat-dev-rangenorm/ < $devSrcTgt > ${working}/dev_rangenorm.sgm
 
 rm -rf ${working}/score-dev/
 rm ${working}/dev.src
@@ -40,10 +45,15 @@ mkdir ${working}/feat-devtest/
 python ${scripts}/utils/featurize_rules.py -a -s ${working}/score-devtest/ ${working}/feat-devtest/ $counts $lexModel $numProc 
 python ${scripts}/utils/corpus2sgm.py ${working}/feat-devtest/ < $testSrcTgt > ${working}/devtest.sgm
 
-python ${scripts}/decode.py -n $params ${working}/score-devtest/ $numProc < ${working}/devtest.src 
-mkdir ${working}/feat-devtest-norm/
-python ${scripts}/utils/featurize_rules.py -a -s ${working}/score-devtest/ ${working}/feat-devtest-norm/ $counts $lexModel $numProc 
-python ${scripts}/utils/corpus2sgm.py ${working}/feat-devtest-norm/ < $testSrcTgt > ${working}/devtest_norm.sgm
+python ${scripts}/decode.py -n exp $params ${working}/score-devtest/ $numProc < ${working}/devtest.src 
+mkdir ${working}/feat-devtest-expnorm/
+python ${scripts}/utils/featurize_rules.py -a -s ${working}/score-devtest/ ${working}/feat-devtest-expnorm/ $counts $lexModel $numProc 
+python ${scripts}/utils/corpus2sgm.py ${working}/feat-devtest-expnorm/ < $testSrcTgt > ${working}/devtest_expnorm.sgm
+
+python ${scripts}/decode.py -n range $params ${working}/score-devtest/ $numProc < ${working}/devtest.src 
+mkdir ${working}/feat-devtest-rangenorm/
+python ${scripts}/utils/featurize_rules.py -a -s ${working}/score-devtest/ ${working}/feat-devtest-rangenorm/ $counts $lexModel $numProc 
+python ${scripts}/utils/corpus2sgm.py ${working}/feat-devtest-rangenorm/ < $testSrcTgt > ${working}/devtest_rangenorm.sgm
 
 rm -rf ${working}/score-devtest/
 rm ${working}/devtest.src
@@ -51,6 +61,7 @@ rm ${working}/devtest.src
 #MIRA tuning
 ${cdec}/training/mira/mira.py -d ${working}/dev.sgm -t ${working}/devtest.sgm -c $config -j $numProc -o ${working}/mira --max-iterations 10 -w $weights_init
 ${cdec}/training/mira/mira.py -d ${working}/dev.sgm -t ${working}/devtest.sgm -c $config -j $numProc -o ${working}/mira.rand-init --max-iterations 10
-${cdec}/training/mira/mira.py -d ${working}/dev_norm.sgm -t ${working}/devtest_norm.sgm -c $config -j $numProc -o ${working}/mira.score-norm --max-iterations 10 -w $weights_init
+${cdec}/training/mira/mira.py -d ${working}/dev_expnorm.sgm -t ${working}/devtest_expnorm.sgm -c $config -j $numProc -o ${working}/mira.exp-norm --max-iterations 10 -w $weights_init
+${cdec}/training/mira/mira.py -d ${working}/dev_rangenorm.sgm -t ${working}/devtest_rangenorm.sgm -c $config -j $numProc -o ${working}/mira.range-norm --max-iterations 10 -w $weights_init
 
 
