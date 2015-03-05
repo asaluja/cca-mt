@@ -4,16 +4,15 @@ import sys, commands, string, os, time, gzip, cPickle, math
 import numpy as np
 import scipy.sparse as sp
 import scipy.io as io
-import wabbit_wappa as ww
 from scipy.special import expit
 from mlp import MLPClassifier
+
 
 def compute_regression(X, Y, reg_strength):
     pwd = os.getcwd()
     out_locX1 = pwd + "/x1"
     out_locX2 = pwd + "/x2"
-    #file is large: split into 2
-    N = X.shape[0] / 2
+    N = X.shape[0] / 2 #file is large: split into 2
     io.savemat(out_locX1, {'X1': X[:N,:]})
     io.savemat(out_locX2, {'X2': X[N:,:]})
     out_locY = pwd + "/y"
@@ -30,8 +29,10 @@ def compute_cca(X, Y, reg_strength, rank, approx, mean_center):
     p1 = X.shape[1]
     p2 = Y.shape[1]
     n = X.shape[0]
-    X = sp.csr_matrix(X)
-    cross_cov = X.transpose().dot(Y)
+    #X = sp.csr_matrix(X) 
+    cross_cov = None
+    if approx != "full":
+        cross_cov = X.transpose().dot(Y)
     if mean_center:
         feature_counts_left = np.multiply(X.sum(axis=0), 1./n)
         feature_counts_right = np.multiply(Y.sum(axis=0), 1./n)
@@ -53,6 +54,7 @@ def compute_cca(X, Y, reg_strength, rank, approx, mean_center):
         scale_vec_right = np.reciprocal(np.sqrt(feature_counts_right))
         whiten_left = sp.spdiags(scale_vec_left.flatten(), [0], p1, p1)
         whiten_right = sp.spdiags(scale_vec_right.flatten(), [0], p2, p2)
+        #do we need to change below for dense matrices? 
         cross_cov = whiten_left*cross_cov*whiten_right #scipy sparse matrices * operator is matrix mult
     elif approx == "ppmi": 
         inv_feat_counts_left = np.reciprocal(X.sum(axis=0)+1) #add one if not in training but only in held-out
@@ -64,25 +66,52 @@ def compute_cca(X, Y, reg_strength, rank, approx, mean_center):
         cross_cov.data = np.log(cross_cov.data) - np.log(reg_strength) #element-wise log and shift
         cross_cov.data *= cross_cov.data > 0 #filtering out non-zeros
         cross_cov.eliminate_zeros()
-    if approx == "full":
+    if approx == "full": #X can be large, especially in dense case - need a long-term solution to this!
+        N = X.shape[0] / 8
         out_locX1 = pwd + "/x1"
         out_locX2 = pwd + "/x2"
-        #file is large: split into 2
-        N = X.shape[0] / 2
+        out_locX3 = pwd + "/x3"
+        out_locX4 = pwd + "/x4"
+        out_locX5 = pwd + "/x5"
+        out_locX6 = pwd + "/x6"
+        out_locX7 = pwd + "/x7"
+        out_locX8 = pwd + "/x8"
         io.savemat(out_locX1, {'X1': X[:N,:]})
-        io.savemat(out_locX2, {'X2': X[N:,:]})
-        out_locY = pwd + "/y"
-        io.savemat(out_locY, {'Y': Y})
+        io.savemat(out_locX2, {'X2': X[N:2*N,:]})
+        io.savemat(out_locX3, {'X3': X[2*N:3*N,:]})
+        io.savemat(out_locX4, {'X4': X[3*N:4*N,:]})
+        io.savemat(out_locX5, {'X5': X[4*N:5*N,:]})
+        io.savemat(out_locX6, {'X6': X[5*N:6*N,:]})
+        io.savemat(out_locX7, {'X7': X[6*N:7*N,:]})
+        io.savemat(out_locX8, {'X8': X[7*N:,:]})
+        out_locY1 = pwd + "/y1"
+        out_locY2 = pwd + "/y2"
+        out_locY3 = pwd + "/y3"
+        out_locY4 = pwd + "/y4"
+        out_locY5 = pwd + "/y5"
+        out_locY6 = pwd + "/y6"
+        out_locY7 = pwd + "/y7"
+        out_locY8 = pwd + "/y8"
+        io.savemat(out_locY1, {'Y1': Y[:N,:]})
+        io.savemat(out_locY2, {'Y2': Y[N:2*N,:]})
+        io.savemat(out_locY3, {'Y3': Y[2*N:3*N,:]})
+        io.savemat(out_locY4, {'Y4': Y[3*N:4*N,:]})
+        io.savemat(out_locY5, {'Y5': Y[4*N:5*N,:]})
+        io.savemat(out_locY6, {'Y6': Y[5*N:6*N,:]})
+        io.savemat(out_locY7, {'Y7': Y[6*N:7*N,:]})
+        io.savemat(out_locY8, {'Y8': Y[7*N:,:]})
         path = os.path.abspath(os.path.dirname(sys.argv[0])) 
         os.chdir(path+"/matlab") #matlab scripts in 'matlab' sub-directory
-        os.system('matlab -nodesktop -nosplash -nojvm -r "cca_wrapper ' + "%s %s %s %s %s"%(out_locX1, out_locX2, out_locY, rank, reg_strength) + '"')  
+        os.system('matlab -nodesktop -nosplash -nojvm -r "cca_wrapper ' + "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s"%(out_locX1, out_locX2, out_locX3, out_locX4, out_locX5, out_locX6, out_locX7, out_locX8, out_locY1, out_locY2, out_locY3, out_locY4, out_locY5, out_locY6, out_locY7, out_locY8, rank, reg_strength) + '"')  
     else:
         io.savemat(out_loc, {'avgOP': cross_cov})
         path = os.path.abspath(os.path.dirname(sys.argv[0])) 
         os.chdir(path+"/matlab")
         os.system('matlab -nodesktop -nosplash -nojvm -r "matlab_svd ' + out_loc + " %s"%rank + '"')
     os.chdir(pwd)
-    mat_return = io.loadmat(out_locY) if approx == "full" else io.loadmat(out_loc)
+    out_locY1 = pwd + "/y1"
+    mat_return = io.loadmat(out_locY1) if approx == "full" else io.loadmat(out_loc)
+    os.system('rm *.mat') #clean up .mat files
     if approx == "diag": #if diag approx, multiply result by scaling
         return whiten_left.dot(mat_return['U']), whiten_right.dot(mat_return['V']), mat_return['S']
     else: #for full CCA, already scaled in cca_direct.m
@@ -325,7 +354,6 @@ class MLR(BaseModel):
         marker = "ldf" if self.ldf is not None else "cost"
         if uniform_cost:
             marker += ".uniform"
-        marker = "shuffle.cost.uniform"
         out_loc = out_dir + "/vw_train.%s.gz"%marker
         pp_counts = training_labels.sum(axis=0) #cost function for negative examples depends on this            
         N = training_labels.shape[0]             
@@ -356,6 +384,7 @@ class MLR(BaseModel):
                     else:
                         out_fh.write("%s | %s\n"%(label_str, feature_str))
             out_fh.close()
+            os.system('zcat %s | shuf > %s/temp; gzip %s/temp; mv %s/temp.gz %s'%(out_loc, out_dir, out_dir, out_dir, out_loc)) #shuffle data
             if self.ldf is not None: #write out dictionary that maps source phrases to IDs (for feature decoration in LDF)
                 out_fh = open(out_dir+"/vw_ldf.srcphr.dict", 'wb')
                 cPickle.dump(self.ldf, out_fh)
@@ -370,8 +399,8 @@ class MLR(BaseModel):
                 print "For label-dependent features: read in src phrase to ID dictionary"
             print "Already wrote training data to %s.  Starting VW training..."%out_loc
 
-        #self.model_loc = out_dir+"/mlr.%1g.model"%gamma
-        self.model_loc = out_dir+"/mlr.shuffle.model"
+        self.model_loc = out_dir+"/mlr.%1g.model"%gamma
+        #self.model_loc = out_dir+"/bfgs.model"
         if not os.path.isfile(self.model_loc): #if model does not exist, train it
             vw_command = ""
             if self.ldf is None:                
@@ -417,8 +446,9 @@ class MLR(BaseModel):
             context_rep = context_reps[idx,:] #context_rep could be sparse here
             col_idxs, phrase_pairs = self.get_candidate_indices(phrase)
             col_idxs = [idx for idx in col_idxs if idx != -1] #could be empty if all phrase pairs are less than threshold or have been pruned
+            #need to handle empty col_idxs: occurs if all phrase pairs for source phrase are not in model
             label_str = ' '.join(["%d"%col_idx for col_idx in col_idxs])
-            if self.ldf is not None: 
+            if self.ldf is not None: #label-dependent features
                 labels = label_str.split()
                 src_id = self.ldf[phrase] if phrase in self.ldf else 0 #will not be in ldf srcphrase dictionary if all examples of pp are in heldout
                 feature_str = self.__label_features(context_rep, src_id)
@@ -431,8 +461,8 @@ class MLR(BaseModel):
         ex_fh.close()
         vw_command = 'vw --quiet -i %s -t -p %s -r %s < %s'%(self.model_loc, ex_predictions, ex_scores, ex_filename)
         os.system(vw_command)
-        if self.ldf is None: #for non LDF 
-            os.system("sed '/^$/d' %s"%ex_scores) #just in case, NN outputs have empty lines
+        #if self.ldf is None: #for non LDF 
+        #    os.system("sed -i '/^$/d' %s"%ex_scores) #just in case, NN outputs have empty lines
 
         pred_fh = open(ex_predictions, 'rb')
         predictions_raw = [line.strip() for line in pred_fh.readlines()]
@@ -476,7 +506,7 @@ class MLR(BaseModel):
                 if col_idxs[real_idx] >= 0: #phrase pair can be scored, and guaranteed that scored dict is not None
                     score = scored_dict[col_idxs[real_idx]]
                     scored_pps.append((phrase_pair, score, representation))
-                else:
+                else: #if all phrase pairs have None score, then scored dict is also None
                     scored_pps.append((phrase_pair, None, representation))
             scored_pps_all.append(scored_pps)
         os.system('rm %s; rm %s; rm %s'%(ex_filename, ex_predictions, ex_scores))

@@ -50,8 +50,6 @@ def compute_feature_thresholds(model, tokens_loc):
     try:
         lowdim_context = training_data.dot(model.context_parameters)
         context_pos_means, context_neg_means = compute_signdep_means(lowdim_context)
-        print context_pos_means
-        print context_neg_means
     except AttributeError:
         context_pos_means, context_neg_means = compute_signdep_means(training_data)
     model.set_context_means(context_pos_means, context_neg_means)
@@ -64,10 +62,12 @@ def compute_feature_thresholds(model, tokens_loc):
 do these as global variables because we want to share them amongst processes
 if we pass them to the threads, it makes things much slower. 
 '''
-(opts, args) = getopt.getopt(sys.argv[1:], 'd:n:r')
+(opts, args) = getopt.getopt(sys.argv[1:], 'd:cn:pr')
 normalize = "none"
 represent = False
 discretize = ""
+plain = False
+no_cca = False
 for opt in opts:
     if opt[0] == '-n':
         normalize = opt[1]
@@ -75,6 +75,10 @@ for opt in opts:
         represent = True
     elif opt[0] == '-d': 
         discretize = opt[1] #location of sparse tokens and context
+    elif opt[0] == '-p': #plain - no markup
+        plain = True
+    elif opt[0] == '-c': #no cca_on/off feature
+        no_cca = True
 if normalize != "none" and normalize != "exp" and normalize != "range":
     sys.stderr.write("Error! normalization option not recognized (valid options are 'none', 'exp', and 'range'). Setting to 'none'\n")
     normalize = "none"
@@ -109,8 +113,8 @@ def main():
     pool = mp.Pool(processes=num_process, initializer=init, initargs=(failed_sentences,))
     for sent_num, line in enumerate(sys.stdin):
         out_filename = output_dir + "/grammar.%d.gz"%sent_num
-        parse(line.strip().split(), out_filename, sent_num)
-        #pool.apply_async(parse, (line.strip().split(), out_filename, sent_num))
+        #parse(line.strip().split(), out_filename, sent_num)
+        pool.apply_async(parse, (line.strip().split(), out_filename, sent_num))
     pool.close()
     pool.join()
     print "number of failed sentences: %d"%(len(failed_sentences))
@@ -157,7 +161,7 @@ def parse(words, out_filename, lineNum):
         print "SUCESS! Time taken to compute scores: %.2f sec, sentence ID: %d"%(cca_time, lineNum)
     else:
         print "FAIL; length: %d words, time taken: %.2f sec, sentence ID: %d; sentence: %s"%(len(words), parseTime, lineNum, ' '.join(words))
-        #failed_sentences.append(lineNum)
+        failed_sentences.append(lineNum)
     sys.stdout.flush()
 
 def compute_scores(hg, words, out_filename):
@@ -167,7 +171,7 @@ def compute_scores(hg, words, out_filename):
         head = hg.nodes_[edge.headNode]
         left_idx = head.i
         right_idx = head.j
-        LHS = head.cat[:-1] + "_%d_%d]"%(left_idx, right_idx)
+        LHS = head.cat[:-1] + "_%d_%d]"%(left_idx, right_idx) if not plain else head.cat 
         if len(edge.tailNodes) > 0: #ITG rules
             src_decorated = decorate_src_rule(hg, edge.id)
             monotone = "[1] [2] ||| Glue=1"
@@ -185,7 +189,7 @@ def compute_scores(hg, words, out_filename):
                 if left_con_lr is not None and right_con_lr is not None: #valid context
                     concat_con_lr = np.concatenate((left_con_lr, right_con_lr))
                     phrases_to_score.append((LHS, edge.rule, concat_con_lr))
-                else: #this occurs if all context words are stop words
+                else: #this occurs if all context words are stop words - may want to edit what happens in this branch condition in light of recent changes
                     left_null = left_con_lr is None
                     null_context_side = "left" if left_null else "right"
                     null_context = ' '.join(left_con_words) if left_null else ' '.join(right_con_words)
@@ -215,15 +219,21 @@ def compute_scores(hg, words, out_filename):
             scored_pps = pps_to_score
         sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #should gracefully handle None values
         for pp, score, rep in sorted_pps:
-            rule_str = "%s ||| %s ||| cca_off=1"%(LHS, pp) if score is None else "%s ||| %s ||| cca_on=1 cca_score=%.5g"%(LHS, pp, score)
+            rule_str = "%s ||| %s ||| "%(LHS, pp)
+            if not no_cca: #meaning we can decorate
+                rule_str += "cca_off=1" if score is None else "cca_on=1"
+            if not plain and score is not None:
+                rule_str += " cca_score=%.5g"%score
             if represent: #if outputting context and/or phrase pair representations
                 assert rep != ""
                 rule_str += " %s"%rep
             rules_out.append(rule_str)
+    rules_out = list(set(rules_out)) #makes rules unique
     out_fh = gzip.open(out_filename, 'wb')
     for rule in rules_out:
         out_fh.write("%s\n"%rule)
-    out_fh.write("[S] ||| [X_0_%d] ||| [1] ||| 0\n"%len(words))
+    top_rule = "[S] ||| [X_0_%d] ||| [1] ||| 0\n"%len(words) if not plain else "[S] ||| [X] ||| [1] ||| 0\n"
+    out_fh.write(top_rule)
     out_fh.close()
 
 def normalize_exp(scored_pps):
@@ -272,7 +282,7 @@ def decorate_src_rule(hg, inEdgeID):
     for item in rule.split():
         if expr.match(item): #NT, we need to decorate with its span
             child = hg.nodes_[tail.pop(0)]
-            NT = child.cat[:-1] + "_%d_%d]"%(child.i,child.j)
+            NT = child.cat[:-1] + "_%d_%d]"%(child.i,child.j) if not plain else child.cat
             rule_decorated.append(NT)
         else:
             rule_decorated.append(item)

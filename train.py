@@ -16,9 +16,11 @@ STDIN: training corpus (can be parallel or just source)
 Flags: see README.md for more details
 '''
 
-import sys, commands, string, gzip, getopt, os, cPickle, time, random
+import sys, commands, string, gzip, getopt, os, cPickle, time, random, gc
+from scipy.special import expit
 from sparsecontainer import *
 from model import *
+import resource
 
 '''
 extracts phrase pairs (tokens) and context, since the phrase pair list
@@ -63,13 +65,14 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
     phrases = []
     ground_truth = []
     example_idxs = []
-    heldout_set = set(heldout_idxs)
+    sq_loss = 0
+    print "Heldout: beginning evaluation"
     for idx, test_idx in enumerate(heldout_idxs): #assemble phrases
         rows, cols = tokens.get_token_matrix()[test_idx,:].nonzero()
         if len(cols) == 1: #if it is not a zero row, otherwise it has been pruned
             phrase_pair = tokens.get_token_phrase(cols[0])            
             src_phrase = phrase_pair.split(' ||| ')[0]
-            if src_phrase != "<unk>":
+            if src_phrase != "<unk>": #if pruned away, then cols[0] will equate to <unk> col
                 phrases.append(src_phrase)
                 ground_truth.append(phrase_pair)
                 example_idxs.append(idx)
@@ -79,7 +82,7 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
         scored_pps_all = model.score_all(heldout_data[example_idxs,:], phrases, 0, False)
     else:
         for idx,src_phrase in enumerate(phrases): #score each phrase individually
-            scored_pps = model.score(heldout_data[example_idxs[idx],:], src_phrase)
+            scored_pps = model.score(heldout_data[example_idxs[idx],:], src_phrase, False)
             scored_pps_all.append(scored_pps)
     print "Heldout: scored phrases"
     for idx,scored_pps in enumerate(scored_pps_all): #compute MRR for scored PPs
@@ -90,17 +93,19 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
             scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0] #because we filtered for singleton PPs, guaranteed that scored_rank is not None
             mrr += 1./scored_rank
             multi_translation_count += 1
+            #score = expit([pp_score[1] for pp_score in sorted_pps if pp_score[0] == phrase_pair][0]) #for passing through logistic function
+            #sq_loss += (1-score)**2 
             if scored_rank > 1: #separate tracking if correct translation was not ranked 1
                 mrr_hard_examples += 1./scored_rank
                 hard_examples_count += 1
     mrr /= multi_translation_count
+    #sq_loss /= multi_translation_count
     mrr_hard_examples /= hard_examples_count
     avg_length = float(avg_length) / multi_translation_count
-    print "Heldout: computed MRR"
-    print "Time taken to evaluate held-out: %.1f sec"%(time.clock()-start)
+    print "Heldout: computed MRR. Total time: %.1f sec"%(time.clock()-start)
     print "Out of %d examples (source phrases), %d are not pruned (singleton/filtered), %d have > 1 translation (restricting scoring to these phrases)"%(len(heldout_idxs), len(scored_pps_all), multi_translation_count)
     print "Mean Reciprocal Rank: %.3f; Average number of translations per phrase: %.2f"%(mrr, avg_length)
-    print "Mean Reciprocal Rank for phrase pairs not ranked 1: %.3f"%mrr_hard_examples
+    print "Mean Reciprocal Rank for phrase pairs not ranked 1: %.3f; Number of such examples: %d"%(mrr_hard_examples, hard_examples_count)
 
 def extract_excluded_PPs(counts_dict, cutoff):
     excluded_PPs = set()
@@ -239,7 +244,7 @@ def main():
         high_dim = False
 
     excluded_pairs = set()
-    if filter_cutoff > 0:
+    if filter_cutoff > 0: #if P(e|f) filtering is enabled
         counts_fh = open(filter_grammar, 'rb')
         counts_dict = cPickle.load(counts_fh)
         counts_fh.close()        
@@ -264,7 +269,7 @@ def main():
         use_wordvecs = vector_loc != ""
         left_con = SparseContext(oov) #OOV parameter is estimated by default for context
         right_con = SparseContext(oov)
-        print "Sentence Count: ",
+        print "Sentence Count:",
         for count, line in enumerate(sys.stdin):
             source = line.strip().split(' ||| ')[0]
             phrase_pair_fh = gzip.open(phrase_pairs_loc + "/grammar.%d.gz"%count)
@@ -297,7 +302,6 @@ def main():
     print "Number of PPs seen (incl. singletons, excl. filtered rules): %d"%len(all_phrase_pairs)
     print "Number of excluded rules (filtered out): %d"%len(excluded_pairs)
     print "Left context dim: %d; Right context dim: %d"%(left_con.get_token_matrix().shape[1], right_con.get_token_matrix().shape[1])
-
     heldout_idxs = None
     train_idxs = None
     if heldout_frac > 0 or shrinkage_frac > 0:
@@ -323,6 +327,10 @@ def main():
             cPickle.dump(context, context_fh)
             context_fh.close()
     lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con_train, right_con_train)
+    if vector_loc != "": #word vectors take up lot of memory, so need to do some hacky garbage collection (Python sucks for this!)
+        del left_con_train
+        del right_con_train
+        gc.collect()
     print "Computed/loaded context representations. Starting model training."
 
     #compute parameters for low-rank phrase disambiguation model

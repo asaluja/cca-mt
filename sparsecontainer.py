@@ -7,7 +7,7 @@ Description: contains SparseContainer, SparseContext (child
 of SparseContainer), and ContextExtractor classes. 
 '''
 
-import sys, commands, string
+import sys, commands, string, gc
 import numpy as np
 import scipy.sparse as sp
 
@@ -160,8 +160,12 @@ class SparseContext(SparseContainer):
         self._vals.append(rep)
 
     def create_dense_matrix(self): 
-        self.token_matrix = np.vstack(self._vals)
-        self.token_matrix -= np.divide(self.token_matrix.sum(axis=0), self.token_matrix.shape[0])
+        stacked_features = np.vstack(self._vals)
+        mean_center_vec = np.divide(stacked_features.sum(axis=0), stacked_features.shape[0])
+        self.token_matrix = stacked_features - mean_center_vec
+        print "Created dense matrix from word vectors"
+        del self._vals
+        gc.collect()
 
     def create_sparse_matrix(self, pos_depend, con_length):
         if len(self._oov_map) > 0: #there is at least one feature that we have seen <= self.cut_off times
@@ -184,6 +188,7 @@ class SparseContext(SparseContainer):
                     self._cols.append(oov_feat_id)
                     self._vals.append(1.)
         self.token_matrix = sp.csr_matrix((self._vals, (self._rows, self._cols)), shape = (self._counter, len(self.type_id_map)))
+        print "Created sparse matrix from counts"
 
     def filter_zero_rows(self, zero_rows):
         rows = []

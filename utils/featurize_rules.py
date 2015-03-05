@@ -136,7 +136,7 @@ def decorateSentenceGrammar(minRule_file, out_file, lex_model, optDict):
         minrule_fh = gzip.open(minRule_file, 'rb')
         for rule in minrule_fh:
             numRulesTotal += 1
-            elements = rule.strip().split(' ||| ')
+            elements = rule.rstrip('\n').split(' ||| ')
             key = ' ||| '.join(elements[1:3]) if perSent else ' ||| '.join(elements[:2])
             ruleToPrint = rule.strip()
             if not perSent: #writing out full grammar, so strip alignment info
