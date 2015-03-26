@@ -35,7 +35,6 @@ python ${scripts}/utils/corpus2sgm.py ${working}/feat-dev-rangenorm/ < $devSrcTg
 rm -rf ${working}/score-dev/
 rm ${working}/dev.src
 
-
 #devtest
 ${cdec}/corpus/cut-corpus.pl 1 < $testSrcTgt > ${working}/devtest.src
 mkdir ${working}/score-devtest/

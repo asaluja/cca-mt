@@ -7,6 +7,11 @@ import scipy.io as io
 from scipy.special import expit
 from mlp import MLPClassifier
 
+'''
+To Do: migrate MLP to VW setup
+Also, clean up and figure out a better way to write out large .mat files for Matlab computation
+'''
+
 
 def compute_regression(X, Y, reg_strength):
     pwd = os.getcwd()
@@ -283,7 +288,6 @@ class CCA(BaseModel):
     def train(self, left_low_rank, right_low_rank, training_labels, gamma, rank, approx, mean_center):
         training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
         phi_s, phi_w, cw_correlations = compute_cca(training_data, training_labels, gamma, rank, approx, mean_center)
-        #over here, if discretize flag on, then compute + and - means of trianing data
         self.context_parameters = phi_s
         self.parameters = phi_w
         print "Two-step CCA complete. Correlations between combined context and tokens (with rank %d): "%rank
@@ -308,6 +312,22 @@ class CCA(BaseModel):
             else:
                 scored_pairs.append((phrase_pair, score, rep_str))
         return scored_pairs
+
+class SVM(BaseModel):
+    def __init__(self, context, type_map, all_pp):
+        super(SVM, self).__init__(type_map, all_pp, context, False)
+
+    def train(self, left_low_rank, right_low_rank, training_labels, gamma, out_dir):
+        training_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
+        N = training_labels.shape[0]
+        out_fh = open(out_dir + "/svm.training", 'wb')
+        for row_idx in range(N):        
+            label_row, label_col = training_labels[row_idx,:].nonzero()
+            if len(label_row) == 1: #could be zero row
+                phrase_id = label_col[0] + 1
+                feature_str = ["%d:%.5g"%(idx+1,val) for idx,val in enumerate(training_data[row_idx,:])]
+                print >> out_fh, '%d %s'%(phrase_id, ' '.join(feature_str))
+        out_fh.close()
     
 class MLR(BaseModel):
     def __init__(self, context, type_map, all_pp, ldf, high_dim):
@@ -513,19 +533,22 @@ class MLR(BaseModel):
         return scored_pps_all
 
 class GLM(BaseModel):
-    def __init__(self, context, type_map, all_pp):
+    def __init__(self, context, type_map, all_pp, lm_scores_add):
         super(GLM, self).__init__(type_map, all_pp, context, False)
         self.alphas = None
+        self.lm_score = lm_scores_add
 
-    def train(self, left_low_rank, right_low_rank, training_labels, gamma):
-        offset = np.ones((left_low_rank.shape[0], 1))        
-        training_data = np.concatenate((left_low_rank, right_low_rank, offset), axis=1) #if each low-rank context is p-dim, then this is a 2p+1 dim vec
+    def train(self, left_low_rank, right_low_rank, training_labels, gamma, lm_scores=None):        
+        offset = np.ones((left_low_rank.shape[0], 1))
+        if self.lm_score:
+            lm_scores = lm_scores.reshape((lm_scores.shape[0], 1))
+        training_data = np.concatenate((left_low_rank, right_low_rank, lm_scores, offset), axis=1) if self.lm_score else np.concatenate((left_low_rank, right_low_rank, offset), axis=1)
         self.parameters = compute_regression(training_data, training_labels, gamma)
         print "Fitted general linear model: %d responses %d predictors, %d samples"%(self.parameters.shape[1], self.parameters.shape[0], left_low_rank.shape[0])
 
     def score(self, context_rep, phrase, print_reps): 
         col_idxs, phrase_pairs = self.get_candidate_indices(phrase) #some of the col_idxs may be -1 
-        aug_context_rep = np.append(context_rep, np.ones((1,)))
+        aug_context_rep = np.concatenate((context_rep, np.zeros((1,)), np.ones((1,))), axis=1) if self.lm_score else np.append(context_rep, np.ones((1,)))
         if self.alphas is not None: #then element-wise multiply with alpha vec
             assert self.alphas.shape == aug_context_rep.shape
             aug_context_rep *= self.alphas

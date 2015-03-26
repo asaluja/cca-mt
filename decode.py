@@ -62,10 +62,11 @@ def compute_feature_thresholds(model, tokens_loc):
 do these as global variables because we want to share them amongst processes
 if we pass them to the threads, it makes things much slower. 
 '''
-(opts, args) = getopt.getopt(sys.argv[1:], 'd:cn:pr')
+(opts, args) = getopt.getopt(sys.argv[1:], 'd:cCn:pr')
 normalize = "none"
 represent = False
 discretize = ""
+covariance = False
 plain = False
 no_cca = False
 for opt in opts:
@@ -79,12 +80,17 @@ for opt in opts:
         plain = True
     elif opt[0] == '-c': #no cca_on/off feature
         no_cca = True
+    elif opt[0] == '-C': #covariance/second order feature for vectors
+        covariance = True
 if normalize != "none" and normalize != "exp" and normalize != "range":
     sys.stderr.write("Error! normalization option not recognized (valid options are 'none', 'exp', and 'range'). Setting to 'none'\n")
     normalize = "none"
 if discretize and not represent: 
     sys.stderr.write("Error! Cannot have discretize on ('-d') without representations being printed out ('-r'); Turning it off\n")
     discretize = False
+if covariance and not represent:
+    sys.stderr.write("Error! Cannot have covariance features on ('-C') without representations being printed out ('-r'); Turning it off\n")
+    covariance = False
 
 param_filename = args[0]
 output_dir = args[1]
@@ -96,6 +102,7 @@ param_fh.close()
 phrase_pairs = ["[X] ||| " + pair for pair in model.get_tokens()]
 phrase_pairs.append("[X] ||| [X,1] [X,2] ||| [1] [2]")
 phrase_pairs.append("[X] ||| [X,1] [X,2] ||| [2] [1]")
+#dev_grammars=args[3]
 grammar_trie = trie(phrase_pairs)
 print "Data structures from training stage loaded"
 if discretize != "": #compute relevant statistics for discretization
@@ -137,6 +144,15 @@ def parse(words, out_filename, lineNum):
     passive = {}
     nodemap = {}
     seedActiveChart(N, active)
+    dev_rules = {}
+    #dev psg read in (for oracle)
+    #dev_filename = dev_grammars + "/grammar.%d.gz"%lineNum
+    #dev_fh = gzip.open(dev_filename, 'rb')
+    #for line in dev_fh:
+    #    src,tgt,align = line.strip().split(' ||| ')
+    #    key = (src, align)
+    #    dev_rules[key] = tgt
+    #dev_fh.close()
     for l in range(1, N+1): #length
         for i in range(0, N+1-l): #left index of span            
             j = i + l #right index of span
@@ -156,7 +172,7 @@ def parse(words, out_filename, lineNum):
     if goal_idx: #i.e., if we have created at least 1 node in the HG corresponding to goal        
         print "Parsed sentence; length: %d words, time taken: %.2f sec, sentence ID: %d"%(len(words), parseTime, lineNum)
         start = time.clock()
-        compute_scores(hg, words, out_filename)
+        compute_scores(hg, words, out_filename, dev_rules)
         cca_time = time.clock() - start
         print "SUCESS! Time taken to compute scores: %.2f sec, sentence ID: %d"%(cca_time, lineNum)
     else:
@@ -164,9 +180,10 @@ def parse(words, out_filename, lineNum):
         failed_sentences.append(lineNum)
     sys.stdout.flush()
 
-def compute_scores(hg, words, out_filename):
+def compute_scores(hg, words, out_filename, dev_rules):
     rules_out = []
     phrases_to_score = []
+    phrases_for_oracle = [] #this has been added
     for edge in hg.edges_: #first, go through hypergraph process rules that can be written out; store scorable rules for scoring later
         head = hg.nodes_[edge.headNode]
         left_idx = head.i
@@ -189,6 +206,7 @@ def compute_scores(hg, words, out_filename):
                 if left_con_lr is not None and right_con_lr is not None: #valid context
                     concat_con_lr = np.concatenate((left_con_lr, right_con_lr))
                     phrases_to_score.append((LHS, edge.rule, concat_con_lr))
+                    phrases_for_oracle.append((edge.rule, left_idx, right_idx-1)) #this has been added
                 else: #this occurs if all context words are stop words - may want to edit what happens in this branch condition in light of recent changes
                     left_null = left_con_lr is None
                     null_context_side = "left" if left_null else "right"
@@ -206,10 +224,14 @@ def compute_scores(hg, words, out_filename):
             scored_pps_all = model.score_all(context_reps, src_phrases, sent_num, represent)
     else:
         for LHS, src_phrase, context_rep in phrases_to_score:
-            scored_pps = model.score(context_rep, src_phrase, represent) 
-            scored_pps_all.append(scored_pps)
+            scored_pps = model.score(context_rep, src_phrase, represent) #scored_pps gives idx
+            scored_pps_all.append(scored_pps) 
     for idx,pps_to_score in enumerate(scored_pps_all): #final processing of scored phrases
         LHS = phrases_to_score[idx][0]
+        #src_phrase, left_idx, right_idx_incl = phrases_for_oracle[idx]
+        #key = (src_phrase, "%d-%d"%(left_idx, right_idx_incl))
+        #source_oracle = True if key in dev_rules else False
+        #target_oracle = dev_rules[key] if key in dev_rules else ""
         scored_pps = []
         if normalize == "exp":
             scored_pps = normalize_exp(pps_to_score)
@@ -218,15 +240,25 @@ def compute_scores(hg, words, out_filename):
         else:
             scored_pps = pps_to_score
         sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #should gracefully handle None values
+        best_pp = sorted_pps[0][0]
         for pp, score, rep in sorted_pps:
             rule_str = "%s ||| %s ||| "%(LHS, pp)
             if not no_cca: #meaning we can decorate
                 rule_str += "cca_off=1" if score is None else "cca_on=1"
             if not plain and score is not None:
                 rule_str += " cca_score=%.5g"%score
+                #if pp == best_pp:
+                #    rule_str += " cca_best=1"
             if represent: #if outputting context and/or phrase pair representations
-                assert rep != ""
-                rule_str += " %s"%rep
+                assert rep != ""      
+                if covariance:
+                    rep = compute_second_order(rep); 
+                rule_str += " %s"%rep 
+            #if source_oracle:
+            #    rule_str += " oracle_source=1"
+            #target = pp.split(' ||| ')[1]
+            #if target == target_oracle:
+            #    rule_str += " oracle_target=1"
             rules_out.append(rule_str)
     rules_out = list(set(rules_out)) #makes rules unique
     out_fh = gzip.open(out_filename, 'wb')
@@ -235,6 +267,16 @@ def compute_scores(hg, words, out_filename):
     top_rule = "[S] ||| [X_0_%d] ||| [1] ||| 0\n"%len(words) if not plain else "[S] ||| [X] ||| [1] ||| 0\n"
     out_fh.write(top_rule)
     out_fh.close()
+
+def compute_second_order(rep):
+    str_rep = []
+    context_vals = np.array([float(element.split('=')[1]) for element in rep.split() if element.split('=')[0].split('_')[0] == 'c'])
+    pp_vals = np.array([float(element.split('=')[1]) for element in rep.split() if element.split('=')[0].split('_')[0] == 'pp'])
+    outer_prod = np.outer(context_vals, pp_vals)
+    for idx,val in enumerate(outer_prod.flatten()): 
+        str_rep.append("op%d=%.3g"%(idx,val))
+        #str_rep.append("op_dim%d=%.3g"%(idx,val))
+    return ' '.join(str_rep)
 
 def normalize_exp(scored_pps):
     normalizer = sum([math.exp(score) for pp,score,reps in scored_pps if score is not None]) #will be zero if all is none

@@ -4,6 +4,12 @@
 File: add_target_context.py
 Date: March 24, 2015
 Description: adds target context to phrase pairs
+Inputs:
+arg1: per-sentence minimal phrase pair grammars
+arg2: word alignments
+arg3: context length (on each side), integer
+arg4: output directory
+to do: change output from sentence-level to writing out to one big file
 '''
 
 import sys, commands, string, gzip, collections

@@ -1,4 +1,4 @@
-#!/usr/bin/python -tt
+ #!/usr/bin/python -tt
 
 '''
 File: training.py
@@ -118,9 +118,18 @@ def extract_excluded_PPs(counts_dict, cutoff):
                 filtered_rule = ' ||| '.join([src_rule, rule]) #form phrase pair
                 excluded_PPs.add(filtered_rule)
     return excluded_PPs
+
+def read_lm_scores(lm_scores_loc, lm_scores):
+    lm_fh = open(lm_scores_loc, 'rb')
+    for line in lm_fh:
+        val = float(line.strip().split()[1])
+        length = int(line.strip().split()[-1])
+        normalized_val = val / length
+        lm_scores.append(normalized_val)
+    lm_fh.close()
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'cC:f:F:g:h:Hl:Lm:Mo:OpP:s:S:r:t:uv:w:')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'a:cC:f:F:g:h:Hl:Lm:Mo:OpP:s:S:r:t:uv:w:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
@@ -148,6 +157,7 @@ def main():
     heldout_frac = 0
     shrinkage_frac = 0
     high_dim = False
+    lm_score_loc = ""
     for opt in opts:
         if opt[0] == '-l': #context length 
             con_length = int(opt[1])
@@ -185,7 +195,7 @@ def main():
             prune_tokens = int(opt[1])
         elif opt[0] == '-O':
             estimate_oov_param = True
-        elif opt[0] == '-m': #method - one of 'cca', 'glm', 'mlr', or 'mlp'
+        elif opt[0] == '-m': #method - one of 'cca', 'glm', 'mlr', 'svm', or 'mlp'
             method = opt[1]
         elif opt[0] == '-c': #concatenation models (instead of additive)
             concat = True
@@ -209,6 +219,8 @@ def main():
             uniform_cost = True
         elif opt[0] == '-H': #high-dimensional
             high_dim = True
+        elif opt[0] == '-a': 
+            lm_score_loc = opt[1]
     if phrase_pairs_loc == "" or output_loc == "": #these inputs are required
         sys.stderr.write("Error! Need to define a location for per-sentence phrase pairs and an output directory to write parameters\n")
         sys.exit() 
@@ -227,8 +239,8 @@ def main():
     if not (whitening == "identity" or whitening == "full" or whitening == "diag" or whitening == "ppmi"):
         sys.stderr.write("Error! Whitening values can only be 'identity', 'full' (inverse square root), 'diag' (approximation to inverse square root), or 'ppmi' (PPMI scaling)\n")
         sys.exit()
-    if not (method == "cca" or method == "glm" or method == "mlr" or method == "mlp"):
-        sys.stderr.write("Error! Currently supported supervised methods are 'cca', 'glm', 'mlr', lr 'mlp'\n")
+    if not (method == "cca" or method == "glm" or method == "mlr" or method == "mlp" or method == "svm"):
+        sys.stderr.write("Error! Currently supported supervised methods are 'cca', 'glm', 'mlr', 'svm', or 'mlp'\n")
         sys.exit()
     if prune_tokens == 0 and estimate_oov_param is True: 
         sys.stderr.write("Error! OOV parameter estimation for tokens requested, but pruning of tokens is not enabled; set -P to a value greater than 0\n")
@@ -256,6 +268,12 @@ def main():
     right_con = None
     extractor = ContextExtractor(con_length, pos_depend, filter_sw, filter_features, vector_loc)
     all_phrase_pairs = set()
+    lm_scores = [] #dictionary with keys being token IDs, and value being LM score of that token
+    lm_score_add = False
+    if lm_score_loc != "": #read in lm_scores
+        read_lm_scores(lm_score_loc, lm_scores)
+        lm_score_add = True
+    lm_scores = np.array(lm_scores)
     if tokens_loc != "" and os.path.isfile(tokens_loc): #read-in pre-computed feature files if requested - this needs to be consistent with filtering
         tokens_fh = open(tokens_loc, 'rb')
         tokens = cPickle.load(tokens_fh)
@@ -336,14 +354,15 @@ def main():
     #compute parameters for low-rank phrase disambiguation model
     model = None
     training_labels = tokens.get_token_matrix(train_idxs) if train_idxs is not None else tokens.get_token_matrix()
+    lm_scores_train = lm_scores[train_idxs] if lm_score_add and train_idxs is not None else lm_scores
     if method == "cca":
         model = CCA(context, tokens.get_type_map(), all_phrase_pairs)
         if whitening == "ppmi": #can't do PPMI again because dense context representations have negative values
             whitening = "full"
         model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, rank2, whitening, mean_center)
     elif method == "glm":
-        model = GLM(context, tokens.get_type_map(), all_phrase_pairs)
-        model.train(lr_mat_l, lr_mat_r, training_labels, gamma2)
+        model = GLM(context, tokens.get_type_map(), all_phrase_pairs, lm_score_add)
+        model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, lm_scores_train)
     elif method == "mlr": #multilcass logistic regression
         model = MLR(context, tokens.get_type_map(), all_phrase_pairs, ldf, high_dim)
         if high_dim:
@@ -353,6 +372,9 @@ def main():
     elif method == "mlp":
         model = MLP(context, tokens.get_type_map(), all_phrase_pairs, gamma2, rank2)
         model.train(lr_mat_l, lr_mat_r, training_labels)
+    elif method == "svm":
+        model = SVM(context, tokens.get_type_map(), all_phrase_pairs)
+        model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, os.path.dirname(output_loc))
     else:
         sys.stderr.write("Model argument not recognized; please input one of 'cca', 'glm', or 'mlp'\n")
         sys.exit()
@@ -364,7 +386,8 @@ def main():
             model.shrink_estimates(lr_mat_l, lr_mat_r, tokens, heldout_idxs)
             score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model) #score again to see improvement    
     print "Model training complete"
-
+    
+    #write model to disk
     start = time.clock()
     out_fh = open(output_loc, 'wb')
     cPickle.dump(model, out_fh)
