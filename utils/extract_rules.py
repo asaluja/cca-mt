@@ -19,7 +19,10 @@ Options:
 -m X: adjust the maximum length of a phrase extracted (default is 6)
 -l: extract lexical translations instead of phrase pairs. STDIN is ignored in this setting. 
 January 20, 2015: updated and added counts dictionary writing here (for downstream feature computation).  
-To Do: instead of defined s-exprsesion parser, use nltk?
+March 26, 2015: fixed bug in phrase pair expansion to get rid of NTs; previously, unaligned target words
+were not included in the target side of the phrase pair
+To Do: separate returnYield() functions to handle source and target sides separately
+(use target sentence and alignments for target yield to capture un-aligned target words)
 '''
 
 import sys, commands, string, collections, gzip, re, getopt, cPickle
@@ -112,7 +115,7 @@ class minimal_tree:
         rule = "%s ||| %s"%(' '.join(src_rule), ' '.join(tgt_rule_sorted))
         return src_sp, tgt_sp, rule
 
-    def returnYield(self):
+    def returnYield_helper(self):
         expr = re.compile(r'\[([^]]*)\]')
         if len(self.children) == 0: #pre-terminal
             return self.rule.split(' ||| ')
@@ -125,7 +128,7 @@ class minimal_tree:
                 isNT = expr.match(item)
                 if isNT: #NT
                     NT_idx = int(isNT.group(1))
-                    srcYield, tgtYield = self.children[NT_idx-1].returnYield()
+                    srcYield, tgtYield = self.children[NT_idx-1].returnYield_helper()
                     src_rule.append(srcYield)
                     tgt_candidates.append(tgtYield)
                 else:
@@ -139,7 +142,29 @@ class minimal_tree:
                     tgt_rule.append(item)
             return ' '.join(src_rule), ' '.join(tgt_rule)
 
-    def printTree(self, output_fh, max_length, count_dict):
+    def returnYield_main(self, tgt_items):
+        expr = re.compile(r'\[([^]]*)\]')
+        if len(self.children) == 0:
+            return self.rule.split(' ||| ')
+        else:
+            src_rule_items, tgt_rule_items = self.rule.split(' ||| ')
+            src_rule = []
+            for item in src_rule_items.split():
+                isNT = expr.match(item)
+                if isNT:
+                    NT_idx = int(isNT.group(1))
+                    srcYield, tgtYield = self.children[NT_idx-1].returnYield_helper()
+                    src_rule.append(srcYield)
+                else:
+                    src_rule.append(item)
+            start_idx, end_idx = self.target_span
+            tgt_rule = []
+            for idx in range(start_idx,end_idx + 1): #need to consider range to capture unaligned target words
+                tgt_rule.append(tgt_items[idx])
+            return ' '.join(src_rule), ' '.join(tgt_rule)
+            
+
+    def printTree(self, output_fh, max_length, count_dict, tgt_items):
         if self.lex:
             start_idx, end_idx = self.source_span
             span_length = end_idx - start_idx + 1
@@ -149,11 +174,11 @@ class minimal_tree:
                     src_phrase, tgt_phrase = self.rule.split(' ||| ')
                     add_to_count_dict(count_dict, src_phrase, tgt_phrase)
                 else: #lexical item in a rule with non-terminals
-                    src_rule, tgt_rule = self.returnYield()
+                    src_rule, tgt_rule = self.returnYield_main(tgt_items)
                     output_fh.write("%s ||| %s ||| %d-%d\n"%(src_rule, tgt_rule, start_idx, end_idx))
                     add_to_count_dict(count_dict, src_rule, tgt_rule)
         for child in self.children:
-            child.printTree(output_fh, max_length, count_dict)
+            child.printTree(output_fh, max_length, count_dict, tgt_items)
 
 def add_to_count_dict(counts, src_phrase, tgt_phrase):
     tgt_counts = counts[src_phrase] if src_phrase in counts else {}
@@ -196,7 +221,7 @@ def main():
             printLexicalPairs(out_fh, alignment, src.split(), tgt.split(), count_dict)
         else:
             derivation_tree = minimal_tree(src.split(), tgt.split(), alignment, line.rstrip().lstrip())
-            derivation_tree.printTree(out_fh, max_length, count_dict)
+            derivation_tree.printTree(out_fh, max_length, count_dict, tgt.split())
         out_fh.close()
     count_fh = open(counts_out, 'wb')
     cPickle.dump(count_dict, count_fh)
