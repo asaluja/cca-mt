@@ -1,4 +1,5 @@
  #!/usr/bin/python -tt
+# -*- coding: utf-8 -*-
 
 '''
 File: training.py
@@ -90,22 +91,36 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
             avg_length += len(scored_pps)
             sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #sort by score to get rank
             phrase_pair = ground_truth[idx]
-            scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0] #because we filtered for singleton PPs, guaranteed that scored_rank is not None
-            mrr += 1./scored_rank
-            multi_translation_count += 1
-            #score = expit([pp_score[1] for pp_score in sorted_pps if pp_score[0] == phrase_pair][0]) #for passing through logistic function
-            #sq_loss += (1-score)**2 
-            if scored_rank > 1: #separate tracking if correct translation was not ranked 1
-                mrr_hard_examples += 1./scored_rank
-                hard_examples_count += 1
+            best_score = [pp_score[1] for pp_score in sorted_pps if pp_score[0] == phrase_pair][0]
+            if best_score is not None:
+                scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0] #because we filtered for singleton PPs, guaranteed that scored_rank is not None
+                mrr += 1./scored_rank
+                multi_translation_count += 1
+                #score = expit([pp_score[1] for pp_score in sorted_pps if pp_score[0] == phrase_pair][0]) #for passing through logistic function
+                sq_loss += (1-best_score)**2 
+                if scored_rank > 1: #separate tracking if correct translation was not ranked 1
+                    mrr_hard_examples += 1./scored_rank
+                    hard_examples_count += 1
+            else: #this will happen if all instances of an unpruned phrase happen to be in the heldout set
+                print "Phrase pair '%s' representation is None"%phrase_pair
+                col_id = tokens.type_id_map[phrase_pair]
+                rows, cols = tokens.get_token_matrix()[:,col_id].nonzero()
+                assert len(rows) > 0                
+                for row_idx in rows:
+                    if row_idx not in heldout_idxs: 
+                        print "Error! example idx for phrase pair is in training, not heldout!"
+                        sys.exit()
+                else:
+                    print "All instances of this phrase pair are in heldout"
     mrr /= multi_translation_count
-    #sq_loss /= multi_translation_count
+    sq_loss /= multi_translation_count
     mrr_hard_examples /= hard_examples_count
     avg_length = float(avg_length) / multi_translation_count
     print "Heldout: computed MRR. Total time: %.1f sec"%(time.clock()-start)
     print "Out of %d examples (source phrases), %d are not pruned (singleton/filtered), %d have > 1 translation (restricting scoring to these phrases)"%(len(heldout_idxs), len(scored_pps_all), multi_translation_count)
     print "Mean Reciprocal Rank: %.3f; Average number of translations per phrase: %.2f"%(mrr, avg_length)
     print "Mean Reciprocal Rank for phrase pairs not ranked 1: %.3f; Number of such examples: %d"%(mrr_hard_examples, hard_examples_count)
+    print "Squared Error: %.3f"%sq_loss
 
 def extract_excluded_PPs(counts_dict, cutoff):
     excluded_PPs = set()
@@ -119,17 +134,37 @@ def extract_excluded_PPs(counts_dict, cutoff):
                 excluded_PPs.add(filtered_rule)
     return excluded_PPs
 
-def read_lm_scores(lm_scores_loc, lm_scores):
-    lm_fh = open(lm_scores_loc, 'rb')
-    for line in lm_fh:
+'''
+function that populates the list 'lm_scores_all' passed in as an argument
+lm_scores_all is indexed by the training example ID (row ID), and each element is
+a dictionary of (target_phrase, LM score) pairs.  The data is used downstream
+when we output features for our matching model. 
+'''
+def read_lm_scores(lm_phrases_loc, lm_scores_loc, cutoff, lm_scores_all):
+    lm_ph_fh = open(lm_phrases_loc, 'rb')
+    lm_phrases = lm_ph_fh.read().splitlines()
+    lm_ph_fh.close()
+    lm_scores_fh = open(lm_scores_loc, 'rb')
+    lm_scores = lm_scores_fh.read().splitlines()
+    lm_scores_fh.close()
+    lm_scores_per_phrase = {}
+    for idx,line in enumerate(lm_scores):
         val = float(line.strip().split()[1])
-        length = int(line.strip().split()[-1])
-        normalized_val = val / length
-        lm_scores.append(normalized_val)
-    lm_fh.close()
+        if val < 0: #valid
+            src_phrase, tgt_phrase, context = lm_phrases[idx].strip().split(' ||| ')
+            num_words = len(context.split())
+            lm_scores_per_phrase[tgt_phrase] = -val/num_words
+            #lm_scores_per_phrase.append(-val/num_words)
+        else: #finished reading in scores for source phrase
+            assert lm_phrases[idx].strip() == ""
+            #while len(lm_scores_per_phrase) < cutoff: #zero-padding
+            #    lm_scores_per_phrase.append(0)
+            #lm_scores_all.append(list(lm_scores_per_phrase))
+            lm_scores_all.append(dict(lm_scores_per_phrase))
+            lm_scores_per_phrase = {}
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'a:cC:f:F:g:h:Hl:Lm:Mo:OpP:s:S:r:t:uv:w:')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'a:A:cC:f:F:g:h:Hl:Lm:Mo:OpP:s:S:r:t:uv:w:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
@@ -158,6 +193,7 @@ def main():
     shrinkage_frac = 0
     high_dim = False
     lm_score_loc = ""
+    matching_model = 0
     for opt in opts:
         if opt[0] == '-l': #context length 
             con_length = int(opt[1])
@@ -220,7 +256,13 @@ def main():
         elif opt[0] == '-H': #high-dimensional
             high_dim = True
         elif opt[0] == '-a': 
-            lm_score_loc = opt[1]
+            lm_options = opt[1].split(',')
+            if len(lm_options) != 2:
+                sys.stderr.write("Error! If LM score addition option (-a) selected, then need to provide the list of phrase pairs and context in one file, separated by their LM scores, separated by comma ','\n")
+                sys.exit()
+            lm_phrases_loc, lm_score_loc = lm_options[0], lm_options[1]
+        elif opt[0] == '-A':
+            matching_model = int(opt[1])
     if phrase_pairs_loc == "" or output_loc == "": #these inputs are required
         sys.stderr.write("Error! Need to define a location for per-sentence phrase pairs and an output directory to write parameters\n")
         sys.exit() 
@@ -254,6 +296,9 @@ def main():
     if high_dim and method != "mlr":
         sys.stderr.write("Warning! High-dimensional features only work with -m 'mlr'.  Ignoring...\n")
         high_dim = False
+    if matching_model > 0 and method != "cca": #currently only works with cca
+        sys.stderr.write("Warning! Matching model only works with CCA.  Ignoring '-A' flag.\n'")
+        matching_model = 0
 
     excluded_pairs = set()
     if filter_cutoff > 0: #if P(e|f) filtering is enabled
@@ -268,12 +313,6 @@ def main():
     right_con = None
     extractor = ContextExtractor(con_length, pos_depend, filter_sw, filter_features, vector_loc)
     all_phrase_pairs = set()
-    lm_scores = [] #dictionary with keys being token IDs, and value being LM score of that token
-    lm_score_add = False
-    if lm_score_loc != "": #read in lm_scores
-        read_lm_scores(lm_score_loc, lm_scores)
-        lm_score_add = True
-    lm_scores = np.array(lm_scores)
     if tokens_loc != "" and os.path.isfile(tokens_loc): #read-in pre-computed feature files if requested - this needs to be consistent with filtering
         tokens_fh = open(tokens_loc, 'rb')
         tokens = cPickle.load(tokens_fh)
@@ -320,6 +359,16 @@ def main():
     print "Number of PPs seen (incl. singletons, excl. filtered rules): %d"%len(all_phrase_pairs)
     print "Number of excluded rules (filtered out): %d"%len(excluded_pairs)
     print "Left context dim: %d; Right context dim: %d"%(left_con.get_token_matrix().shape[1], right_con.get_token_matrix().shape[1])
+    lm_scores = [] #dictionary with keys being token IDs, and value being LM score of that token
+    lm_score_add = False
+    if lm_score_loc != "": #read in lm_scores
+        if matching_model > 0:
+            read_lm_scores(lm_phrases_loc, lm_score_loc, filter_cutoff, lm_scores)
+            lm_score_add = True
+            assert len(lm_scores) == tokens.get_token_matrix().shape[0]
+        else:
+            sys.stderr.write("LM scores only used in matching model, which has not been enabled; ignoring LM scores\n")
+    #lm_scores = np.array(lm_scores) #will this work with list of lists? change this
     heldout_idxs = None
     train_idxs = None
     if heldout_frac > 0 or shrinkage_frac > 0:
@@ -354,12 +403,19 @@ def main():
     #compute parameters for low-rank phrase disambiguation model
     model = None
     training_labels = tokens.get_token_matrix(train_idxs) if train_idxs is not None else tokens.get_token_matrix()
-    lm_scores_train = lm_scores[train_idxs] if lm_score_add and train_idxs is not None else lm_scores
+    #lm_scores_train = lm_scores[train_idxs] if lm_score_add and train_idxs is not None else lm_scores
     if method == "cca":
-        model = CCA(context, tokens.get_type_map(), all_phrase_pairs)
+        model = CCA(context, tokens.get_type_map(), all_phrase_pairs, matching_model > 0)
         if whitening == "ppmi": #can't do PPMI again because dense context representations have negative values
             whitening = "full"
         model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, rank2, whitening, mean_center)
+        if matching_model > 0:
+            lm_scores_train = None
+            if lm_score_add and train_idxs is not None:
+                lm_scores_train = [lm_scores[idx] for idx in train_idxs]
+            elif lm_score_add:
+                lm_scores_train = lm_scores
+            model.train_matching_model(lr_mat_l, lr_mat_r, training_labels, matching_model, tokens.id_type_map, os.path.dirname(output_loc), lm_scores_train)
     elif method == "glm":
         model = GLM(context, tokens.get_type_map(), all_phrase_pairs, lm_score_add)
         model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, lm_scores_train)

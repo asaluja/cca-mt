@@ -54,7 +54,7 @@ class SparseContainer(object):
                     token_id = len(self.type_id_map) if self.estimate_oov else len(self.type_id_map)-1
                     self.type_id_map[token] = token_id #and add to observed features
                     self.id_type_map[token_id] = token
-                if token_id > -1: #meeans we are estimating OOV param
+                if token_id > -1: #meeans we are estimating OOV param or the phrase pair is valid and we add it
                     for row_idx in row_idxs:
                         self._rows.append(row_idx)
                         self._cols.append(token_id) 

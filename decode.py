@@ -62,13 +62,17 @@ def compute_feature_thresholds(model, tokens_loc):
 do these as global variables because we want to share them amongst processes
 if we pass them to the threads, it makes things much slower. 
 '''
-(opts, args) = getopt.getopt(sys.argv[1:], 'd:cCn:pr')
+(opts, args) = getopt.getopt(sys.argv[1:], 'bd:cCln:oprR')
 normalize = "none"
 represent = False
 discretize = ""
 covariance = False
 plain = False
 no_cca = False
+log_score = False
+only_pos = False
+print_best = False
+print_rank = False
 for opt in opts:
     if opt[0] == '-n':
         normalize = opt[1]
@@ -82,6 +86,14 @@ for opt in opts:
         no_cca = True
     elif opt[0] == '-C': #covariance/second order feature for vectors
         covariance = True
+    elif opt[0] == '-l': #put scores in log space
+        log_score = True
+    elif opt[0] == '-o': #only positive scores (0-1)
+        only_pos = True
+    elif opt[0] == '-b': #print best
+        print_best = True
+    elif opt[0] == '-R': #print rak
+        print_rank = True
 if normalize != "none" and normalize != "exp" and normalize != "range":
     sys.stderr.write("Error! normalization option not recognized (valid options are 'none', 'exp', and 'range'). Setting to 'none'\n")
     normalize = "none"
@@ -91,6 +103,11 @@ if discretize and not represent:
 if covariance and not represent:
     sys.stderr.write("Error! Cannot have covariance features on ('-C') without representations being printed out ('-r'); Turning it off\n")
     covariance = False
+if not only_pos and log_score: #would result in domain errors
+    sys.stderr.write("Error! Cannot have log score without restricting scores to be positive; disabling log score\n")
+    log_score = False
+if log_score and no_cca: #if we are not writing scores, then log scores will be ignored
+    sys.stderr.write("Warning! Ignoring log_score ('-l') option, since no_cca flag ('-c') is on\n")    
 
 param_filename = args[0]
 output_dir = args[1]
@@ -236,19 +253,32 @@ def compute_scores(hg, words, out_filename, dev_rules):
         if normalize == "exp":
             scored_pps = normalize_exp(pps_to_score)
         elif normalize == "range":
-            scored_pps = normalize_range(pps_to_score)
+            scored_pps = normalize_range(pps_to_score, only_pos, log_score)
         else:
-            scored_pps = pps_to_score
-        sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True) #should gracefully handle None values
+            if only_pos:
+                for pp,score,reps in pps_to_score:
+                    if score is None:
+                        scored_pps.append((pp, score, reps))
+                    else:
+                        scored_pps.append((pp, 1-np.arccos(score)/math.pi, reps))
+            else:
+                scored_pps = pps_to_score
+        sorted_pps = sorted(scored_pps, key=lambda x: x[1], reverse=True)
         best_pp = sorted_pps[0][0]
+        rank = 0
         for pp, score, rep in sorted_pps:
+            rank += 1
             rule_str = "%s ||| %s ||| "%(LHS, pp)
             if not no_cca: #meaning we can decorate
                 rule_str += "cca_off=1" if score is None else "cca_on=1"
             if not plain and score is not None:
-                rule_str += " cca_score=%.5g"%score
-                #if pp == best_pp:
-                #    rule_str += " cca_best=1"
+                if log_score:
+                    score = -math.log10(score)
+                elif print_rank:
+                    score = rank
+                rule_str += " cca_score=%.3f"%score if log_score else " cca_score=%.5g"%score
+                if print_best and pp == best_pp: 
+                    rule_str += " cca_best=1"
             if represent: #if outputting context and/or phrase pair representations
                 assert rep != ""      
                 if covariance:
@@ -278,6 +308,9 @@ def compute_second_order(rep):
         #str_rep.append("op_dim%d=%.3g"%(idx,val))
     return ' '.join(str_rep)
 
+'''
+no need to pass only_pos to normalize_exp because result of exp normalization is always positive
+'''
 def normalize_exp(scored_pps):
     normalizer = sum([math.exp(score) for pp,score,reps in scored_pps if score is not None]) #will be zero if all is none
     if normalizer != 0:
@@ -291,7 +324,7 @@ def normalize_exp(scored_pps):
             normalized_pps.append(pp_norm)
     return normalized_pps
 
-def normalize_range(scored_pps):
+def normalize_range(scored_pps, only_pos, log_score):
     sum_vals = 0
     num_vals = 0
     min_val = 1000000.0
@@ -302,18 +335,20 @@ def normalize_range(scored_pps):
             sum_vals += score
             max_val = score if score > max_val else max_val
             min_val = score if score < min_val else min_val
-    if num_vals > 1:        
+    if num_vals > 0:        
         average = sum_vals / num_vals
         normalizer = max_val - min_val
+        shift = (min_val - average) / normalizer if only_pos and normalizer != 0 else 0
+        plus_one = 1 if log_score else 0
         normalized_pps = []
         for pp, score, reps in scored_pps:
             if score is None:
                 normalized_pps.append((pp, score, reps))
             else:
-                pp_norm = (pp, (score-average)/normalizer, reps) if normalizer != 0 else (pp, 1./num_vals, reps)
+                pp_norm = (pp, (score-average)/normalizer - shift + plus_one, reps) if normalizer != 0 else (pp, 1./num_vals, reps)                
                 normalized_pps.append(pp_norm)
         return normalized_pps
-    else:
+    else:        
         return scored_pps
 
 def decorate_src_rule(hg, inEdgeID):
