@@ -20,6 +20,7 @@ arg2: number of processes to use for decoding
 import sys, commands, string, time, gzip, re, getopt, math, cPickle
 import multiprocessing as mp
 import numpy as np
+from scipy.special import expit
 from trie import trie, ActiveItem, HyperGraph
 from sparsecontainer import ContextExtractor
 from model import *
@@ -62,7 +63,7 @@ def compute_feature_thresholds(model, tokens_loc):
 do these as global variables because we want to share them amongst processes
 if we pass them to the threads, it makes things much slower. 
 '''
-(opts, args) = getopt.getopt(sys.argv[1:], 'bd:cCln:oprR')
+(opts, args) = getopt.getopt(sys.argv[1:], 'bd:cClLn:oprR')
 normalize = "none"
 represent = False
 discretize = ""
@@ -73,6 +74,7 @@ log_score = False
 only_pos = False
 print_best = False
 print_rank = False
+logistic = False
 for opt in opts:
     if opt[0] == '-n':
         normalize = opt[1]
@@ -92,8 +94,10 @@ for opt in opts:
         only_pos = True
     elif opt[0] == '-b': #print best
         print_best = True
-    elif opt[0] == '-R': #print rak
+    elif opt[0] == '-R': #print rank
         print_rank = True
+    elif opt[0] == '-L': #add logistic function score too
+        logistic = True
 if normalize != "none" and normalize != "exp" and normalize != "range":
     sys.stderr.write("Error! normalization option not recognized (valid options are 'none', 'exp', and 'range'). Setting to 'none'\n")
     normalize = "none"
@@ -221,7 +225,7 @@ def compute_scores(hg, words, out_filename, dev_rules):
                 if len(edge.rule.split()) == 1: #unigram, so write pass-through to be compatible with cdec
                     rules_out.append("%s ||| %s ||| %s ||| PassThrough=1"%(LHS, edge.rule, edge.rule))
                 if left_con_lr is not None and right_con_lr is not None: #valid context
-                    concat_con_lr = np.concatenate((left_con_lr, right_con_lr))
+                    concat_con_lr = np.concatenate((left_con_lr, right_con_lr)) 
                     phrases_to_score.append((LHS, edge.rule, concat_con_lr))
                     phrases_for_oracle.append((edge.rule, left_idx, right_idx-1)) #this has been added
                 else: #this occurs if all context words are stop words - may want to edit what happens in this branch condition in light of recent changes
@@ -275,10 +279,12 @@ def compute_scores(hg, words, out_filename, dev_rules):
                 if log_score:
                     score = -math.log10(score)
                 elif print_rank:
-                    score = rank
+                    score = 1./rank
                 rule_str += " cca_score=%.3f"%score if log_score else " cca_score=%.5g"%score
                 if print_best and pp == best_pp: 
                     rule_str += " cca_best=1"
+                if logistic:
+                    rule_str += " cca_log=%.3f"%expit(score)
             if represent: #if outputting context and/or phrase pair representations
                 assert rep != ""      
                 if covariance:

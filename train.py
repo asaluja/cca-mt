@@ -1,4 +1,4 @@
- #!/usr/bin/python -tt
+#!/usr/bin/python -tt
 # -*- coding: utf-8 -*-
 
 '''
@@ -21,7 +21,7 @@ import sys, commands, string, gzip, getopt, os, cPickle, time, random, gc
 from scipy.special import expit
 from sparsecontainer import *
 from model import *
-import resource
+from source_channel import *
 
 '''
 extracts phrase pairs (tokens) and context, since the phrase pair list
@@ -54,20 +54,13 @@ def extract_tokens(filehandle, sentence, tokens, left_con, right_con, extractor,
                 sys.stderr.write("WARNING! Empty left and/or right context due to stop-word filtering. You may want to either a) reduce the number of stop words or disable stop word filtering altogether or b) enlarge the context window size with the '-l' flag.\n")
                 sys.stderr.write("The phrase pair %s was skipped as a result\n"%phrase_pair)
 
-def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
-    assert left_low_rank.shape[0] == right_low_rank.shape[0] == len(heldout_idxs)
-    start = time.clock()    
-    heldout_data = np.concatenate((left_low_rank, right_low_rank), axis=1)
-    mrr = 0
-    mrr_hard_examples = 0
-    multi_translation_count = 0
-    hard_examples_count = 0
-    avg_length = 0
+def score_heldout(heldout_data, tokens, heldout_idxs, model, sc_model):
+#def score_heldout(heldout_data, tokens, heldout_idxs, model, sc_model, lm_scores, counts, reverse_counts):
     phrases = []
     ground_truth = []
     example_idxs = []
-    sq_loss = 0
     print "Heldout: beginning evaluation"
+    start = time.clock()    
     for idx, test_idx in enumerate(heldout_idxs): #assemble phrases
         rows, cols = tokens.get_token_matrix()[test_idx,:].nonzero()
         if len(cols) == 1: #if it is not a zero row, otherwise it has been pruned
@@ -78,14 +71,48 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
                 ground_truth.append(phrase_pair)
                 example_idxs.append(idx)
     print "Heldout: assembled phrases that can be scored"
-    scored_pps_all = [] #all src phrases
-    if model.isvw(): #then score all phrases together
-        scored_pps_all = model.score_all(heldout_data[example_idxs,:], phrases, 0, False)
-    else:
-        for idx,src_phrase in enumerate(phrases): #score each phrase individually
-            scored_pps = model.score(heldout_data[example_idxs[idx],:], src_phrase, False)
-            scored_pps_all.append(scored_pps)
-    print "Heldout: scored phrases"
+    if sc_model is not None:
+        print "Evaluating Source Channel model"
+        scored_pps_lm, scored_pps_fwd, scored_pps_lm_fwd, scored_pps_rev, scored_pps_lm_rev = [], [], [], [], []
+        for idx,src_phrase in enumerate(phrases): 
+            lm, fwd, lm_fwd, rev, lm_rev = sc_model.score_all(example_idxs[idx], src_phrase)
+            scored_pps_lm.append(lm)
+            scored_pps_fwd.append(fwd)
+            scored_pps_lm_fwd.append(lm_fwd)
+            scored_pps_rev.append(rev)
+            scored_pps_lm_rev.append(lm_rev)
+        print "Heldout: scored phrases"
+        print "LM MRR: "
+        compute_mrr(scored_pps_lm, ground_truth, tokens, heldout_idxs)
+        print "P(e|f) MRR: "
+        compute_mrr(scored_pps_fwd, ground_truth, tokens, heldout_idxs)
+        print "LM + P(e|f) MRR: "
+        compute_mrr(scored_pps_lm_fwd, ground_truth, tokens, heldout_idxs)
+        print "P(f|e) MRR: "
+        compute_mrr(scored_pps_rev, ground_truth, tokens, heldout_idxs)
+        print "LM + P(f|e) MRR: "
+        compute_mrr(scored_pps_lm_rev, ground_truth, tokens, heldout_idxs)
+    else:        
+        scored_pps_all = [] #all src phrases
+        if model.isvw(): #then score all phrases together
+            #lm_scores_new = [lm_dict for idx,lm_dict in enumerate(lm_scores) if idx in example_idxs]
+            #scored_pps_all = model.score_all(heldout_data[example_idxs,:], phrases, 0, False, lm_scores_new, counts, reverse_counts)
+            scored_pps_all = model.score_all(heldout_data[example_idxs,:], phrases, 0, False)
+        else:
+            for idx,src_phrase in enumerate(phrases): #score each phrase individually            
+                scored_pps = model.score(heldout_data[example_idxs[idx],:], src_phrase, False) 
+                scored_pps_all.append(scored_pps)
+        print "Heldout: scored phrases"
+        compute_mrr(scored_pps_all, ground_truth, tokens, heldout_idxs)
+    print "Heldout: computed MRR. Total time: %.1f sec"%(time.clock()-start)
+
+def compute_mrr(scored_pps_all, ground_truth, tokens, heldout_idxs):
+    mrr = 0
+    mrr_hard_examples = 0
+    multi_translation_count = 0
+    hard_examples_count = 0
+    avg_length = 0
+    sq_loss = 0
     for idx,scored_pps in enumerate(scored_pps_all): #compute MRR for scored PPs
         if len(scored_pps) > 1: #only record MRR for src phrases with more than one translation
             avg_length += len(scored_pps)
@@ -96,7 +123,6 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
                 scored_rank = [rank+1 for rank, pp_score in enumerate(sorted_pps) if pp_score[0] == phrase_pair][0] #because we filtered for singleton PPs, guaranteed that scored_rank is not None
                 mrr += 1./scored_rank
                 multi_translation_count += 1
-                #score = expit([pp_score[1] for pp_score in sorted_pps if pp_score[0] == phrase_pair][0]) #for passing through logistic function
                 sq_loss += (1-best_score)**2 
                 if scored_rank > 1: #separate tracking if correct translation was not ranked 1
                     mrr_hard_examples += 1./scored_rank
@@ -116,7 +142,6 @@ def score_heldout(left_low_rank, right_low_rank, tokens, heldout_idxs, model):
     sq_loss /= multi_translation_count
     mrr_hard_examples /= hard_examples_count
     avg_length = float(avg_length) / multi_translation_count
-    print "Heldout: computed MRR. Total time: %.1f sec"%(time.clock()-start)
     print "Out of %d examples (source phrases), %d are not pruned (singleton/filtered), %d have > 1 translation (restricting scoring to these phrases)"%(len(heldout_idxs), len(scored_pps_all), multi_translation_count)
     print "Mean Reciprocal Rank: %.3f; Average number of translations per phrase: %.2f"%(mrr, avg_length)
     print "Mean Reciprocal Rank for phrase pairs not ranked 1: %.3f; Number of such examples: %d"%(mrr_hard_examples, hard_examples_count)
@@ -154,17 +179,23 @@ def read_lm_scores(lm_phrases_loc, lm_scores_loc, cutoff, lm_scores_all):
             src_phrase, tgt_phrase, context = lm_phrases[idx].strip().split(' ||| ')
             num_words = len(context.split())
             lm_scores_per_phrase[tgt_phrase] = -val/num_words
-            #lm_scores_per_phrase.append(-val/num_words)
         else: #finished reading in scores for source phrase
             assert lm_phrases[idx].strip() == ""
-            #while len(lm_scores_per_phrase) < cutoff: #zero-padding
-            #    lm_scores_per_phrase.append(0)
             #lm_scores_all.append(list(lm_scores_per_phrase))
             lm_scores_all.append(dict(lm_scores_per_phrase))
             lm_scores_per_phrase = {}
+
+def convert_counts_dict(counts_dict):
+    reverse = {}
+    for src_phrase in counts_dict:
+        for tgt_phrase in counts_dict[src_phrase]:
+            source_dict = reverse[tgt_phrase] if tgt_phrase in reverse else {}
+            source_dict[src_phrase] = counts_dict[src_phrase][tgt_phrase]
+            reverse[tgt_phrase] = source_dict
+    return reverse
     
 def main():
-    (opts, args) = getopt.getopt(sys.argv[1:], 'a:A:cC:f:F:g:h:Hl:Lm:Mo:OpP:s:S:r:t:uv:w:')
+    (opts, args) = getopt.getopt(sys.argv[1:], 'a:A:bcC:dDf:F:g:h:Hl:Lm:Mo:OpP:s:S:r:t:uv:V:w:')
     phrase_pairs_loc = args[0]
     output_loc = args[1]
     con_length = 2
@@ -193,7 +224,12 @@ def main():
     shrinkage_frac = 0
     high_dim = False
     lm_score_loc = ""
-    matching_model = 0
+    matching_model = 0    
+    relative_estimates = False
+    use_lm_filter = False
+    context_vec_loc = ""
+    pp_vec_loc = ""
+    source_channel = False
     for opt in opts:
         if opt[0] == '-l': #context length 
             con_length = int(opt[1])
@@ -263,6 +299,19 @@ def main():
             lm_phrases_loc, lm_score_loc = lm_options[0], lm_options[1]
         elif opt[0] == '-A':
             matching_model = int(opt[1])
+        elif opt[0] == '-b': #add relative freq estimates to matching model
+            relative_estimates = True
+        elif opt[0] == '-V': #read in word and phrase vectors for skip-gram model
+            vector_options = opt[1].split(',')
+            if len(vector_options) != 2:
+                sys.stderr.write("Error! If word and phrase vectors from skip-gram selected (-V arg1,arg2) then need to provide the word vectors and the phrase vectors, with the filenames separated by a comma ','\n")
+                sys.exit()
+            context_vec_loc, pp_vec_loc = vector_options[0], vector_options[1]
+        elif opt[0] == '-d': #source-channel model
+            source_channel = True
+            relative_estimates = True
+        elif opt[0] == '-D': #use LM filter when learning matching model
+            use_lm_filter = True
     if phrase_pairs_loc == "" or output_loc == "": #these inputs are required
         sys.stderr.write("Error! Need to define a location for per-sentence phrase pairs and an output directory to write parameters\n")
         sys.exit() 
@@ -281,8 +330,8 @@ def main():
     if not (whitening == "identity" or whitening == "full" or whitening == "diag" or whitening == "ppmi"):
         sys.stderr.write("Error! Whitening values can only be 'identity', 'full' (inverse square root), 'diag' (approximation to inverse square root), or 'ppmi' (PPMI scaling)\n")
         sys.exit()
-    if not (method == "cca" or method == "glm" or method == "mlr" or method == "mlp" or method == "svm"):
-        sys.stderr.write("Error! Currently supported supervised methods are 'cca', 'glm', 'mlr', 'svm', or 'mlp'\n")
+    if not (method == "cca" or method == "glm" or method == "mlr" or method == "mlp" or method == "svm" or method == "sg"):
+        sys.stderr.write("Error! Currently supported supervised methods are 'cca', 'glm', 'mlr', 'svm', 'mlp', or 'sg'\n")
         sys.exit()
     if prune_tokens == 0 and estimate_oov_param is True: 
         sys.stderr.write("Error! OOV parameter estimation for tokens requested, but pruning of tokens is not enabled; set -P to a value greater than 0\n")
@@ -299,13 +348,33 @@ def main():
     if matching_model > 0 and method != "cca": #currently only works with cca
         sys.stderr.write("Warning! Matching model only works with CCA.  Ignoring '-A' flag.\n'")
         matching_model = 0
+    if (matching_model > 0 or source_channel) and relative_estimates and filter_cutoff == 0:
+        sys.stderr.write("Warning! Filter cutoff is 0, so we don't have relative estimates information; ignorning relative estimates\n")
+        relative_estimates = False
+    if method == "sg" and (context_vec_loc == "" or pp_vec_loc == ""): 
+        sys.stderr.write("Error! Cannot do 'sg' (skip-gram) method if context and phrase pair vector locations have not been defined! Exiting...\n")
+        sys.exit()
+    if source_channel and (lm_phrases_loc == "" or lm_score_loc == ""):
+        sys.stderr.write("Error! With source-channel model flag on ('-d'), need to have LM scores.  Exiting...\n")
+        sys.exit()
+    if use_lm_filter and matching_model == 0: 
+        sys.stderr.write("Warning! Matching model not enabled, but use_lm_filter enabled; ignoring the latter...\n")
+        use_lm_filter = False
+    if use_lm_filter and (lm_phrases_loc == "" or lm_score_loc == ""): 
+        sys.stderr.write("Warning! use_lm_filter flag ('-D') enabled, but no LM information through '-a' flag provided; Ignoring...\n")
+        use_lm_filter = False
 
     excluded_pairs = set()
+    counts_dict = None
+    reverse_counts_dict = None
     if filter_cutoff > 0: #if P(e|f) filtering is enabled
         counts_fh = open(filter_grammar, 'rb')
         counts_dict = cPickle.load(counts_fh)
         counts_fh.close()        
         excluded_pairs = extract_excluded_PPs(counts_dict, filter_cutoff)
+        if relative_estimates:
+            reverse_counts_dict = convert_counts_dict(counts_dict)
+
     #set up data structures and extract context features and tokens from corpus
     start = time.clock()
     tokens = None
@@ -359,16 +428,15 @@ def main():
     print "Number of PPs seen (incl. singletons, excl. filtered rules): %d"%len(all_phrase_pairs)
     print "Number of excluded rules (filtered out): %d"%len(excluded_pairs)
     print "Left context dim: %d; Right context dim: %d"%(left_con.get_token_matrix().shape[1], right_con.get_token_matrix().shape[1])
+
     lm_scores = [] #dictionary with keys being token IDs, and value being LM score of that token
     lm_score_add = False
-    if lm_score_loc != "": #read in lm_scores
-        if matching_model > 0:
-            read_lm_scores(lm_phrases_loc, lm_score_loc, filter_cutoff, lm_scores)
-            lm_score_add = True
-            assert len(lm_scores) == tokens.get_token_matrix().shape[0]
-        else:
-            sys.stderr.write("LM scores only used in matching model, which has not been enabled; ignoring LM scores\n")
-    #lm_scores = np.array(lm_scores) #will this work with list of lists? change this
+    if lm_score_loc != "" and (matching_model > 0 or source_channel): #read in lm_scores
+        read_lm_scores(lm_phrases_loc, lm_score_loc, filter_cutoff, lm_scores)
+        lm_score_add = True
+        assert len(lm_scores) == tokens.get_token_matrix().shape[0]
+        print "Finished reading in LM scores"
+    
     heldout_idxs = None
     train_idxs = None
     if heldout_frac > 0 or shrinkage_frac > 0:
@@ -383,7 +451,9 @@ def main():
     context = None
     left_con_train = left_con.get_token_matrix(train_idxs) if train_idxs is not None else left_con.get_token_matrix()
     right_con_train = right_con.get_token_matrix(train_idxs) if train_idxs is not None else right_con.get_token_matrix()
-    if context_loc != "" and os.path.isfile(context_loc): #read in pre-computed context
+    if method == "sg":
+        context = SGContext(context_vec_loc)
+    elif context_loc != "" and os.path.isfile(context_loc): #read in pre-computed context
         context_fh = open(context_loc, 'rb')
         context = cPickle.load(context_fh)
         context_fh.close()
@@ -393,7 +463,9 @@ def main():
             context_fh = open(context_loc, 'wb')
             cPickle.dump(context, context_fh)
             context_fh.close()
-    lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con_train, right_con_train)
+    lr_mat_l, lr_mat_r = None, None
+    if method != "sg":
+        lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con_train, right_con_train)
     if vector_loc != "": #word vectors take up lot of memory, so need to do some hacky garbage collection (Python sucks for this!)
         del left_con_train
         del right_con_train
@@ -403,19 +475,19 @@ def main():
     #compute parameters for low-rank phrase disambiguation model
     model = None
     training_labels = tokens.get_token_matrix(train_idxs) if train_idxs is not None else tokens.get_token_matrix()
-    #lm_scores_train = lm_scores[train_idxs] if lm_score_add and train_idxs is not None else lm_scores
     if method == "cca":
         model = CCA(context, tokens.get_type_map(), all_phrase_pairs, matching_model > 0)
         if whitening == "ppmi": #can't do PPMI again because dense context representations have negative values
             whitening = "full"
-        model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, rank2, whitening, mean_center)
-        if matching_model > 0:
-            lm_scores_train = None
-            if lm_score_add and train_idxs is not None:
-                lm_scores_train = [lm_scores[idx] for idx in train_idxs]
-            elif lm_score_add:
-                lm_scores_train = lm_scores
-            model.train_matching_model(lr_mat_l, lr_mat_r, training_labels, matching_model, tokens.id_type_map, os.path.dirname(output_loc), lm_scores_train)
+        if not source_channel:
+            model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, rank2, whitening, mean_center)
+            if matching_model > 0:
+                lm_scores_train = None
+                if lm_score_add and train_idxs is not None:
+                    lm_scores_train = [lm_scores[idx] for idx in train_idxs]
+                elif lm_score_add:
+                    lm_scores_train = lm_scores
+                model.train_matching_model(lr_mat_l, lr_mat_r, training_labels, matching_model, tokens.id_type_map, os.path.dirname(output_loc), lm_scores_train, use_lm_filter, counts_dict, reverse_counts_dict)
     elif method == "glm":
         model = GLM(context, tokens.get_type_map(), all_phrase_pairs, lm_score_add)
         model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, lm_scores_train)
@@ -431,25 +503,42 @@ def main():
     elif method == "svm":
         model = SVM(context, tokens.get_type_map(), all_phrase_pairs)
         model.train(lr_mat_l, lr_mat_r, training_labels, gamma2, os.path.dirname(output_loc))
+    elif method == "sg": #skip-gram
+        model = SG(context, tokens.get_type_map(), all_phrase_pairs)        
+        model.train(pp_vec_loc)
     else:
         sys.stderr.write("Model argument not recognized; please input one of 'cca', 'glm', or 'mlp'\n")
         sys.exit()
+
     if heldout_frac > 0 or shrinkage_frac > 0: #evaluate held-out if requested
         print "Starting heldout evaluation"
-        lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con.get_token_matrix(heldout_idxs), right_con.get_token_matrix(heldout_idxs))    
-        score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model)
+        lm_scores_heldout = [lm_scores[idx] for idx in heldout_idxs] if lm_score_add else None
+        sc_model = SourceChannel(lm_scores_heldout, model.type_id_map, counts_dict, reverse_counts_dict) if source_channel else None
+        heldout_data = None
+        if method == "sg":
+            left_words, right_words = context.convert_token_matrices(left_con.get_type_map(), left_con.get_token_matrix(heldout_idxs), right_con.get_type_map(), right_con.get_token_matrix(heldout_idxs)) #returns words
+            left_reps = np.array([context.get_representation(words) for words in left_words])
+            right_reps = np.array([context.get_representation(words) for words in right_words])
+            heldout_data = left_reps + right_reps #added together
+        else:
+            lr_mat_l, lr_mat_r = context.compute_lowrank_training_contexts(left_con.get_token_matrix(heldout_idxs), right_con.get_token_matrix(heldout_idxs))
+            assert lr_mat_l.shape[0] == lr_mat_r.shape[0] == len(heldout_idxs)
+            heldout_data = np.concatenate((lr_mat_l, lr_mat_r), axis=1)
+        score_heldout(heldout_data, tokens, heldout_idxs, model, sc_model)
+        #score_heldout(heldout_data, tokens, heldout_idxs, model, sc_model, lm_scores_heldout, counts_dict, reverse_counts_dict)
         if shrinkage_frac > 0:
             model.shrink_estimates(lr_mat_l, lr_mat_r, tokens, heldout_idxs)
-            score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model) #score again to see improvement    
+            score_heldout(lr_mat_l, lr_mat_r, tokens, heldout_idxs, model) #score again to see improvement
     print "Model training complete"
     
     #write model to disk
-    start = time.clock()
-    out_fh = open(output_loc, 'wb')
-    cPickle.dump(model, out_fh)
-    cPickle.dump(extractor, out_fh) #can be very large if using word vectors
-    out_fh.close()
-    print "Wrote parameters to disk; time: %.1f sec"%(time.clock()-start)
+    if not source_channel:
+        start = time.clock()
+        out_fh = open(output_loc, 'wb')
+        cPickle.dump(model, out_fh)
+        cPickle.dump(extractor, out_fh) #can be very large if using word vectors
+        out_fh.close()
+        print "Wrote parameters to disk; time: %.1f sec"%(time.clock()-start)
 
 if __name__ == "__main__":
     main()

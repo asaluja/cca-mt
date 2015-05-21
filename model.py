@@ -1,6 +1,6 @@
 #!/usr/bin/python -tt
 
-import sys, commands, string, os, time, gzip, cPickle, math
+import sys, commands, string, os, time, gzip, cPickle, math, operator
 import numpy as np
 import scipy.sparse as sp
 import scipy.io as io
@@ -122,6 +122,41 @@ def compute_cca(X, Y, reg_strength, rank, approx, mean_center):
         return whiten_left.dot(mat_return['U']), whiten_right.dot(mat_return['V']), mat_return['S']
     else: #for full CCA, already scaled in cca_direct.m
         return mat_return['U'], mat_return['V'], mat_return['S']         
+
+class SGContext:
+    def __init__(self, context_loc): 
+        self.context_map = {}
+        context_fh = open(context_loc, 'rb')
+        for line in context_fh:
+            elements = line.strip().split()
+            if len(elements) > 2:
+                vec = np.array(map(float, elements[1:]))
+                vec_norm = np.linalg.norm(vec)
+                self.context_map[elements[0]] = np.divide(vec, vec_norm) if vec_norm > 0 else np.zeros(len(vec))
+            else:
+                self.rank = int(elements[1])
+        context_fh.close()
+        self.context_map["<s>"] = np.zeros(self.rank)
+
+    def get_representation(self, context_words):
+        context_vec = np.zeros(self.rank)
+        for word in context_words:
+            if word in self.context_map:
+                context_vec += self.context_map[word]
+        return context_vec
+
+    def convert_token_matrices(self, left_type_map, left_token_matrix, right_type_map, right_token_matrix):
+        assert left_token_matrix.shape[0] == right_token_matrix.shape[0]
+        left_map = dict((v,k) for k,v in left_type_map.iteritems()) #guaranteed 1-to-1 mapping
+        right_map = dict((v,k) for k,v in right_type_map.iteritems()) #guaranteed 1-to-1 mapping
+        left_words = []
+        right_words = []
+        for row_idx in xrange(left_token_matrix.shape[0]): #iterate through rows
+            rows, cols = left_token_matrix[row_idx,:].nonzero()
+            left_words.append([left_map[col] for col in cols if left_map[col] in self.context_map])
+            rows, cols = right_token_matrix[row_idx,:].nonzero()
+            right_words.append([right_map[col] for col in cols if right_map[col] in self.context_map])
+        return left_words, right_words
 
 class Context:
     def __init__(self, left_context, left_type, right_context, right_type, gamma, rank, approx, mean_center, concat, con_length):
@@ -281,6 +316,55 @@ class BaseModel(object):
                 str_rep.append("%s_dim%d=%.3g"%(prefix,idx,val))
         return ' '.join(str_rep)
 
+class SG(BaseModel):
+    def __init__(self, context, type_map, all_pp):
+        super(SG, self).__init__(type_map, all_pp, context, False)
+
+    def train(self, pp_loc):
+        self.parameters = {}        
+        pp_fh = open(pp_loc, 'rb')
+        for line in pp_fh:
+            elements = line.strip().split('\t')            
+            if len(elements) == 1: #header info
+                num_pp, rank = line.strip().split()
+                self.rank = int(rank)
+            elif elements[0] != "</s>":                
+                src_phr, tgt_phr = elements[0].split(' ||| ')
+                if tgt_phr != "<UNK>" and src_phr in self.inventory and elements[0] in self.type_id_map:
+                    vec = np.array(map(float, elements[1].split()))
+                    vec_norm = np.linalg.norm(vec)
+                    self.parameters[elements[0]] = np.divide(vec, vec_norm) if vec_norm > 0 else np.zeros(len(vec)) 
+        pp_fh.close()
+
+    def get_context_rep(self, left_words, right_words):
+        left_reps = self.context.get_representation(left_words) #returns numpy array
+        right_reps = self.context.get_representation(right_words) #returns numpy array
+        return left_reps, right_reps
+
+    def score(self, context_rep, phrase, print_reps): 
+        if context_rep.shape[0] > self.rank:
+            assert context_rep.shape[0] == 2*self.rank
+            left_rep = context_rep[:self.rank]
+            right_rep = context_rep[self.rank:]
+            context_rep = left_rep + right_rep
+        vec_norm = np.linalg.norm(context_rep)
+        context_rep = np.divide(context_rep, vec_norm) if vec_norm > 0 else context_rep
+        translations = self.inventory[phrase]
+        scored_pairs = []
+        rep_str = ""
+        if print_reps:
+            rep_str += self.rep2str(context_rep, "c")
+        for translation in translations:
+            phrase_pair = ' ||| '.join([phrase, translation])
+            representation = self.parameters[phrase_pair] if phrase_pair in self.parameters else None
+            score = None if representation is None else representation.dot(context_rep.transpose()) #vectors are unit norm
+            if score is not None:
+                rep_str_trans = rep_str +  " " + self.rep2str(representation, "pp") if print_reps else ""
+                scored_pairs.append((phrase_pair, score, rep_str_trans))
+            else:
+                scored_pairs.append((phrase_pair, score, rep_str))
+        return scored_pairs
+
 class CCA(BaseModel):
     def __init__(self, context, type_map, all_pp, is_vw):
         super(CCA, self).__init__(type_map, all_pp, context, is_vw)
@@ -314,6 +398,7 @@ class CCA(BaseModel):
                 scored_pairs.append((phrase_pair, score, rep_str))
         return scored_pairs
 
+    #def score_all(self, context_reps, phrases, sent_num, print_reps, lm_scores, counts, reverse_counts):
     def score_all(self, context_reps, phrases, sent_num, print_reps):
         assert context_reps.shape[0] == len(phrases)
         dir_loc = os.path.dirname(self.matching_loc) #write temporary files in the same directory as model
@@ -328,19 +413,34 @@ class CCA(BaseModel):
             bidi_con_rep_norm = np.linalg.norm(bidi_con_rep)
             lr_context_norm = np.divide(bidi_con_rep, bidi_con_rep_norm)
             translations = self.inventory[phrase]
+            #lm_dict = lm_scores[idx] #temporary
             for translation in translations:
                 candidate_pair = ' ||| '.join([phrase, translation])
                 representation = self.get_representation(candidate_pair)
                 if representation is not None:
+                    #assert translation in lm_dict #temporary
+                    #lm_score = lm_dict[translation] #temporary
                     num_scorable_phrases += 1
                     r_norm = np.linalg.norm(representation)
                     rep_norm = np.divide(representation, r_norm)
                     features = np.concatenate((lr_context_norm, rep_norm), axis=1)
                     feat_str_list = ['d%d:%.5g'%(idx,val) for idx,val in enumerate(features)]
+                    '''
+                    feat_str_list.append('lm:%.3f'%lm_score)                    
+                    if counts is not None and reverse_counts is not None:
+                        tgt_phrase_counts = counts[phrase]
+                        src_normalizer = float(sum(tgt_phrase_counts.values()))
+                        src_phrase_counts = reverse_counts[translation]
+                        tgt_normalizer = float(sum(src_phrase_counts.values()))
+                        e_given_f = math.log10(tgt_phrase_counts[translation] / src_normalizer)
+                        f_given_e = math.log10(src_phrase_counts[phrase] / tgt_normalizer)
+                        feat_str_list.append('EgivenF:%.3f'%e_given_f)
+                        feat_str_list.append('FgivenE:%.3f'%f_given_e)
+                    '''
                     feat_str = ' '.join(feat_str_list)
                     print >> ex_fh, " | %s"%feat_str
         ex_fh.close()
-        vw_command = 'vw --quiet -i %s -t -p %s --link logistic < %s'%(self.matching_loc, ex_predictions, ex_filename)
+        vw_command = 'vw --quiet -i %s -t -p %s < %s'%(self.matching_loc, ex_predictions, ex_filename)
         os.system(vw_command)
         #we have only written out phrase pairs that are in our model (representation != None); below, when we loop through all phrase pairs, need
         #to handle the fact that some phrase pairs are None and so there will be a mismatch in the array lengths; keep track with 'scores_counter'
@@ -366,7 +466,12 @@ class CCA(BaseModel):
         os.system('rm %s; rm %s'%(ex_predictions, ex_filename))
         return scored_pps_all
 
-    def train_matching_model(self, left_low_rank, right_low_rank, training_labels, rank, id_type_map, out_dir, lm_scores = None):
+    def check_lm_rank(self, tgt_phrase, lm_dict): 
+        sorted_translations = sorted(lm_dict.items(), key=operator.itemgetter(1))
+        pp_rank = [rank+1 for rank, pp_score in enumerate(sorted_translations) if pp_score[0] == tgt_phrase][0]
+        return pp_rank == 1
+
+    def train_matching_model(self, left_low_rank, right_low_rank, training_labels, rank, id_type_map, out_dir, lm_scores, use_lm_filter, counts, rev_counts):
         context = np.concatenate((left_low_rank, right_low_rank), axis=1)
         lr_context = context.dot(self.context_parameters)
         N = training_labels.shape[0]
@@ -381,7 +486,7 @@ class CCA(BaseModel):
                     context_norm = np.linalg.norm(context_rep)
                     context_rep_norm = np.divide(context_rep, context_norm)
                     phrase_pair = id_type_map[label_col[0]]
-                    src_phrase = phrase_pair.split(' ||| ')[0]
+                    src_phrase, tgt_phrase = phrase_pair.split(' ||| ')
                     correct_representation = self.get_representation(phrase_pair)
                     if correct_representation is not None:                         
                         r_norm = np.linalg.norm(correct_representation)
@@ -389,12 +494,25 @@ class CCA(BaseModel):
                         corr_features = np.concatenate((context_rep_norm, cor_rep_norm), axis=1)
                         corr_feat_str = ' '.join(['d%d:%.5g'%(idx,val) for idx,val in enumerate(corr_features)])
                         corr_feat_str = "1 | " + corr_feat_str
+                        #corr_feat_str = "1 |"
                         lm_dict = {}
+                        tgt_phrase_counts = None
+                        src_normalizer = None
                         if lm_scores is not None:
                             lm_dict = lm_scores[row_idx]
-                            tgt_phrase = phrase_pair.split(' ||| ')[1]
-                            lm_score = lm_dict[tgt_phrase]
-                            corr_feat_str += " lm:%.3f"%lm_score
+                            if use_lm_filter and self.check_lm_rank(tgt_phrase, lm_dict): 
+                                continue
+                            lm_score = lm_dict[tgt_phrase]                            
+                            if not use_lm_filter:
+                                corr_feat_str += " lm:%.3f"%lm_score
+                        if counts is not None and rev_counts is not None:
+                            tgt_phrase_counts = counts[src_phrase]
+                            src_normalizer = float(sum(tgt_phrase_counts.values()))
+                            src_phrase_counts = rev_counts[tgt_phrase]
+                            tgt_normalizer = float(sum(src_phrase_counts.values()))
+                            e_given_f = math.log10(tgt_phrase_counts[tgt_phrase] / src_normalizer)
+                            f_given_e = math.log10(src_phrase_counts[src_phrase] / tgt_normalizer)
+                            corr_feat_str += " EgivenF:%.3f FgivenE:%.3f"%(e_given_f, f_given_e)
                         translations = self.inventory[src_phrase]
                         for translation in translations:
                             candidate_pair = ' ||| '.join([src_phrase, translation])
@@ -405,16 +523,25 @@ class CCA(BaseModel):
                                 features = np.concatenate((context_rep_norm, rep_norm), axis=1)
                                 feat_str_list = ['d%d:%.5g'%(idx,val) for idx,val in enumerate(features)]
                                 feat_str = ' '.join(feat_str_list)
-                                if lm_scores is not None:
+                                #feat_str = ''
+                                if lm_scores is not None and not use_lm_filter:
                                     lm_score = lm_dict[translation]
                                     feat_str += " lm:%.3f"%lm_score
+                                if counts is not None and rev_counts is not None:
+                                    e_given_f = math.log10(tgt_phrase_counts[translation] / src_normalizer)
+                                    src_phrase_counts = rev_counts[translation]
+                                    tgt_normalizer = float(sum(src_phrase_counts.values()))
+                                    f_given_e = math.log10(src_phrase_counts[src_phrase] / tgt_normalizer)
+                                    feat_str += " EgivenF:%.3f FgivenE:%.3f"%(e_given_f, f_given_e)
                                 out_fh.write("-1 | %s\n"%feat_str)
+                                #out_fh.write("-1 |%s\n"%feat_str)
                                 out_fh.write("%s\n"%corr_feat_str)
             out_fh.close()
-            os.system('zcat %s | shuf > %s/match_train.shuffle; gzip %s/match_train.shuffle'%(out_loc, out_dir, out_dir))
+            print "Finished writing out data for VW training"
+            #os.system('zcat %s | shuf > %s/match_train.shuffle; gzip %s/match_train.shuffle'%(out_loc, out_dir, out_dir))
         self.matching_loc = out_dir + "/matching.rank%d.model"%rank
         if not os.path.isfile(self.matching_loc):
-            vw_command = "vw %s --compressed -c -f %s --loss_function logistic --l2 %.1g --nn %d -b 24 --passes 5 --holdout_off"%(out_loc, self.matching_loc, reg, rank)
+            vw_command = "vw %s --compressed -c -f %s --loss_function logistic --l2 %.1g --nn %d -b 24 --passes 2 --holdout_off"%(out_loc, self.matching_loc, reg, rank)
             print "Running command: %s"%vw_command
             os.system(vw_command)
             print "VW training for matching model complete.  Model located in %s"%self.matching_loc

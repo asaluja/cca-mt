@@ -11,11 +11,11 @@ counts=$7
 lexModel=$8
 numProc=$9
 
-setup_dev=feat-dev-rep-disc
-sgm_dev=dev.rep.disc.sgm
-setup_devtest=feat-devtest-rep-disc
-sgm_devtest=devtest.rep.disc.sgm
-python_command="python ${scripts}/decode.py -r -d /usr0/home/avneesh/cca-translate/data/EMNLP/zh-en/fbis/cca/context+tokens.sparse"
+setup_dev=feat-dev
+sgm_dev=dev.sgm
+setup_devtest=feat-devtest
+sgm_devtest=devtest.sgm
+python_command="python ${scripts}/decode.py"
 #can add various arguments to command above
 
 #dev
